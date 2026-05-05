@@ -1,32 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (C) 2025 Intel Corporation
 
-#include <linux/unaligned.h>
-#include <linux/acpi.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <linux/regulator/consumer.h>
+#include <linux/unaligned.h>
+#include <media/v4l2-cci.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
-#include <linux/clk.h>
-#include <linux/delay.h>
 
-#define IMX471_REG_MODE_SELECT		0x0100
+#define IMX471_REG_MODE_SELECT		CCI_REG8(0x0100)
 #define IMX471_MODE_STANDBY		0x00
 #define IMX471_MODE_STREAMING		0x01
 
 /* Chip ID */
-#define IMX471_REG_CHIP_ID		0x0016
+#define IMX471_REG_CHIP_ID		CCI_REG16(0x0016)
 #define IMX471_CHIP_ID			0x0471
 
 /* V_TIMING internal */
-#define IMX471_REG_FLL			0x0340
+#define IMX471_REG_FLL			CCI_REG16(0x0340)
 #define IMX471_FLL_MAX			0xffff
 
 /* Exposure control */
-#define IMX471_REG_EXPOSURE		0x0202
+#define IMX471_REG_EXPOSURE		CCI_REG16(0x0202)
 #define IMX471_EXPOSURE_MIN		1
 #define IMX471_EXPOSURE_STEP		1
 #define IMX471_EXPOSURE_DEFAULT		0x04f6
@@ -46,22 +47,38 @@
  *  Analog gain use 10 bits in the registers and allowed range is 0 ~ 960
  */
 /* Analog gain control */
-#define IMX471_REG_ANALOG_GAIN		0x0204
-#define IMX471_ANA_GAIN_MIN		0
-#define IMX471_ANA_GAIN_MAX		960
-#define IMX471_ANA_GAIN_STEP		1
-#define IMX471_ANA_GAIN_DEFAULT		0
+#define IMX471_REG_ANALOG_GAIN			CCI_REG16(0x0204)
+#define IMX471_ANA_GAIN_MIN			0
+#define IMX471_ANA_GAIN_MAX			960
+#define IMX471_ANA_GAIN_STEP			1
+#define IMX471_ANA_GAIN_DEFAULT			0
 
 /* Digital gain control */
-#define IMX471_REG_DPGA_USE_GLOBAL_GAIN	0x3ff9
-#define IMX471_REG_DIG_GAIN_GLOBAL	0x020e
-#define IMX471_DGTL_GAIN_MIN		256
-#define IMX471_DGTL_GAIN_MAX		4095
-#define IMX471_DGTL_GAIN_STEP		1
-#define IMX471_DGTL_GAIN_DEFAULT	256
+#define IMX471_REG_DPGA_USE_GLOBAL_GAIN		CCI_REG16(0x3ff9)
+#define IMX471_REG_DIG_GAIN_GLOBAL		CCI_REG16(0x020e)
+#define IMX471_DGTL_GAIN_MIN			256
+#define IMX471_DGTL_GAIN_MAX			4095
+#define IMX471_DGTL_GAIN_STEP			1
+#define IMX471_DGTL_GAIN_DEFAULT		256
+
+#define IMX471_VALUE_08BIT			1
+
+/* HFLIP and VFLIP control */
+#define IMX471_REG_ORIENTATION			CCI_REG8(0x0101)
+#define IMX471_HFLIP_BIT			BIT(0)
+#define IMX471_VFLIP_BIT			BIT(1)
+
+/* Default exposure margin */
+#define IMX471_EXPOSURE_MARGIN			18
+
+/* Horizontal crop window offset */
+#define IMX471_REG_H_WIN_OFFSET			CCI_REG8(0x0409)
+
+/* Vertical crop window offset */
+#define IMX471_REG_V_WIN_OFFSET			CCI_REG8(0x034b)
 
 /* Test Pattern Control */
-#define IMX471_REG_TEST_PATTERN		0x0600
+#define IMX471_REG_TEST_PATTERN			CCI_REG8(0x0600)
 #define IMX471_TEST_PATTERN_DISABLED		0
 #define IMX471_TEST_PATTERN_SOLID_COLOR		1
 #define IMX471_TEST_PATTERN_COLOR_BARS		2
@@ -69,18 +86,17 @@
 #define IMX471_TEST_PATTERN_PN9			4
 
 /* default link frequency and external clock */
-#define IMX471_LINK_FREQ_DEFAULT	200000000LL
-#define IMX471_EXT_CLK			19200000
-#define IMX471_LINK_FREQ_INDEX		0
+#define IMX471_LINK_FREQ_DEFAULT		200000000LL
+#define IMX471_EXT_CLK				19200000
+#define IMX471_LINK_FREQ_INDEX			0
 
-struct imx471_reg {
-	u16 address;
-	u8 val;
-};
+#define IMX471_NUM_SUPPLIES			1
 
-struct imx471_reg_list {
-	u32 num_of_regs;
-	const struct imx471_reg *regs;
+#define to_imx471_data(_sd) container_of_const(_sd, \
+					       struct imx471_data, sd)
+
+static const char * const imx471_supply_name[] = {
+	"avdd",
 };
 
 /* Mode : resolution and related config&values */
@@ -101,15 +117,11 @@ struct imx471_mode {
 	u32 link_freq_index;
 
 	/* Default register values */
-	struct imx471_reg_list reg_list;
+	const struct cci_reg_sequence *default_mode_regs;
+	const int default_mode_regs_length;
 };
 
-struct imx471_hwcfg {
-	u32 ext_clk;			/* sensor external clk */
-	unsigned long link_freq_bitmap;
-};
-
-struct imx471 {
+struct imx471_data {
 	struct v4l2_subdev sd;
 	struct media_pad pad;
 
@@ -119,151 +131,141 @@ struct imx471 {
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *vflip;
+	struct v4l2_ctrl *hflip;
 	struct v4l2_ctrl *exposure;
 
 	struct gpio_desc *reset_gpio;
-	struct regulator *avdd;
+	struct regulator_bulk_data supplies[IMX471_NUM_SUPPLIES];
 	struct clk *img_clk;
 
-	/* Current mode */
-	const struct imx471_mode *cur_mode;
+	struct device *dev;
+	struct regmap *regmap;
 
-	struct imx471_hwcfg *hwcfg;
-
-	/*
-	 * Mutex for serialized access:
-	 * Protect sensor set pad format and start/stop streaming safely.
-	 * Protect access to sensor v4l2 controls.
-	 */
-	struct mutex mutex;
+	int streaming;
 
 	/* True if the device has been identified */
 	bool identified;
 };
 
-static const struct imx471_reg imx471_global_regs[] = {
-	{0x0136, 0x13},
-	{0x0137, 0x33},
-	{0x3c7e, 0x08},
-	{0x3c7f, 0x05},
-	{0x3e35, 0x00},
-	{0x3e36, 0x00},
-	{0x3e37, 0x00},
-	{0x3f7f, 0x01},
-	{0x4431, 0x04},
-	{0x531c, 0x01},
-	{0x531d, 0x02},
-	{0x531e, 0x04},
-	{0x5928, 0x00},
-	{0x5929, 0x2f},
-	{0x592a, 0x00},
-	{0x592b, 0x85},
-	{0x592c, 0x00},
-	{0x592d, 0x32},
-	{0x592e, 0x00},
-	{0x592f, 0x88},
-	{0x5930, 0x00},
-	{0x5931, 0x3d},
-	{0x5932, 0x00},
-	{0x5933, 0x93},
-	{0x5938, 0x00},
-	{0x5939, 0x24},
-	{0x593a, 0x00},
-	{0x593b, 0x7a},
-	{0x593c, 0x00},
-	{0x593d, 0x24},
-	{0x593e, 0x00},
-	{0x593f, 0x7a},
-	{0x5940, 0x00},
-	{0x5941, 0x2f},
-	{0x5942, 0x00},
-	{0x5943, 0x85},
-	{0x5f0e, 0x6e},
-	{0x5f11, 0xc6},
-	{0x5f17, 0x5e},
-	{0x7990, 0x01},
-	{0x7993, 0x5d},
-	{0x7994, 0x5d},
-	{0x7995, 0xa1},
-	{0x799a, 0x01},
-	{0x799d, 0x00},
-	{0x8169, 0x01},
-	{0x8359, 0x01},
-	{0x9302, 0x1e},
-	{0x9306, 0x1f},
-	{0x930a, 0x26},
-	{0x930e, 0x23},
-	{0x9312, 0x23},
-	{0x9316, 0x2c},
-	{0x9317, 0x19},
-	{0xb046, 0x01},
-	{0xb048, 0x01},
+static const struct cci_reg_sequence imx471_global_regs[] = {
+	{ CCI_REG8(0x0136), 0x13 },
+	{ CCI_REG8(0x0137), 0x33 },
+	{ CCI_REG8(0x3c7e), 0x08 },
+	{ CCI_REG8(0x3c7f), 0x05 },
+	{ CCI_REG8(0x3e35), 0x00 },
+	{ CCI_REG8(0x3e36), 0x00 },
+	{ CCI_REG8(0x3e37), 0x00 },
+	{ CCI_REG8(0x3f7f), 0x01 },
+	{ CCI_REG8(0x4431), 0x04 },
+	{ CCI_REG8(0x531c), 0x01 },
+	{ CCI_REG8(0x531d), 0x02 },
+	{ CCI_REG8(0x531e), 0x04 },
+	{ CCI_REG8(0x5928), 0x00 },
+	{ CCI_REG8(0x5929), 0x2f },
+	{ CCI_REG8(0x592a), 0x00 },
+	{ CCI_REG8(0x592b), 0x85 },
+	{ CCI_REG8(0x592c), 0x00 },
+	{ CCI_REG8(0x592d), 0x32 },
+	{ CCI_REG8(0x592e), 0x00 },
+	{ CCI_REG8(0x592f), 0x88 },
+	{ CCI_REG8(0x5930), 0x00 },
+	{ CCI_REG8(0x5931), 0x3d },
+	{ CCI_REG8(0x5932), 0x00 },
+	{ CCI_REG8(0x5933), 0x93 },
+	{ CCI_REG8(0x5938), 0x00 },
+	{ CCI_REG8(0x5939), 0x24 },
+	{ CCI_REG8(0x593a), 0x00 },
+	{ CCI_REG8(0x593b), 0x7a },
+	{ CCI_REG8(0x593c), 0x00 },
+	{ CCI_REG8(0x593d), 0x24 },
+	{ CCI_REG8(0x593e), 0x00 },
+	{ CCI_REG8(0x593f), 0x7a },
+	{ CCI_REG8(0x5940), 0x00 },
+	{ CCI_REG8(0x5941), 0x2f },
+	{ CCI_REG8(0x5942), 0x00 },
+	{ CCI_REG8(0x5943), 0x85 },
+	{ CCI_REG8(0x5f0e), 0x6e },
+	{ CCI_REG8(0x5f11), 0xc6 },
+	{ CCI_REG8(0x5f17), 0x5e },
+	{ CCI_REG8(0x7990), 0x01 },
+	{ CCI_REG8(0x7993), 0x5d },
+	{ CCI_REG8(0x7994), 0x5d },
+	{ CCI_REG8(0x7995), 0xa1 },
+	{ CCI_REG8(0x799a), 0x01 },
+	{ CCI_REG8(0x799d), 0x00 },
+	{ CCI_REG8(0x8169), 0x01 },
+	{ CCI_REG8(0x8359), 0x01 },
+	{ CCI_REG8(0x9302), 0x1e },
+	{ CCI_REG8(0x9306), 0x1f },
+	{ CCI_REG8(0x930a), 0x26 },
+	{ CCI_REG8(0x930e), 0x23 },
+	{ CCI_REG8(0x9312), 0x23 },
+	{ CCI_REG8(0x9316), 0x2c },
+	{ CCI_REG8(0x9317), 0x19 },
+	{ CCI_REG8(0xb046), 0x01 },
+	{ CCI_REG8(0xb048), 0x01 },
 };
 
-static const struct imx471_reg_list imx471_global_setting = {
-	.num_of_regs = ARRAY_SIZE(imx471_global_regs),
-	.regs = imx471_global_regs,
-};
-
-static const struct imx471_reg mode_1928x1088_regs[] = {
-	{0x0101, 0x02},
-	{0x0112, 0x0a},
-	{0x0113, 0x0a},
-	{0x0114, 0x03},
-	{0x0342, 0x0a},
-	{0x0343, 0xe0},
-	{0x0340, 0x04},
-	{0x0341, 0xec},
-	{0x0344, 0x00},
-	{0x0345, 0x00},
-	{0x0346, 0x01},
-	{0x0347, 0xba},
-	{0x0348, 0x12},
-	{0x0349, 0x2f},
-	{0x034a, 0x0b},
-	{0x034b, 0xe0},
-	{0x0381, 0x01},
-	{0x0383, 0x01},
-	{0x0385, 0x01},
-	{0x0387, 0x01},
-	{0x0900, 0x01},
-	{0x0901, 0x22},
-	{0x0902, 0x08},
-	{0x3f4c, 0x81},
-	{0x3f4d, 0x81},
-	{0x0408, 0x00},
-	{0x0409, 0xc9},
-	{0x040a, 0x00},
-	{0x040b, 0x6d},
-	{0x040c, 0x07},
-	{0x040d, 0x88},
-	{0x040e, 0x04},
-	{0x040f, 0x40},
-	{0x034c, 0x07},
-	{0x034d, 0x88},
-	{0x034e, 0x04},
-	{0x034f, 0x40},
-	{0x0301, 0x06},
-	{0x0303, 0x02},
-	{0x0305, 0x02},
-	{0x0306, 0x00},
-	{0x0307, 0x3c},
-	{0x030b, 0x01},
-	{0x030d, 0x02},
-	{0x030e, 0x00},
-	{0x030f, 0x53},
-	{0x0310, 0x01},
-	{0x0202, 0x13},
-	{0x0203, 0x9e},
-	{0x0204, 0x00},
-	{0x0205, 0x00},
-	{0x020e, 0x01},
-	{0x020f, 0x00},
-	{0x3f78, 0x01},
-	{0x3f79, 0x31},
-	{0x3ffe, 0x00},
-	{0x3fff, 0x8a},
-	{0x5f0a, 0xb6},
+static const struct cci_reg_sequence mode_1928x1088_regs[] = {
+	{ CCI_REG8(0x0101), 0x00 },
+	{ CCI_REG8(0x0112), 0x0a },
+	{ CCI_REG8(0x0113), 0x0a },
+	{ CCI_REG8(0x0114), 0x03 },
+	{ CCI_REG8(0x0342), 0x0a },
+	{ CCI_REG8(0x0343), 0x00 },
+	{ CCI_REG8(0x0340), 0x13 },
+	{ CCI_REG8(0x0341), 0xb0 },
+	{ CCI_REG8(0x0344), 0x00 },
+	{ CCI_REG8(0x0345), 0x00 },
+	{ CCI_REG8(0x0346), 0x01 },
+	{ CCI_REG8(0x0347), 0xbc },
+	{ CCI_REG8(0x0348), 0x12 },
+	{ CCI_REG8(0x0349), 0x2f },
+	{ CCI_REG8(0x034a), 0x0b },
+	{ CCI_REG8(0x034b), 0xeb },
+	{ CCI_REG8(0x0381), 0x01 },
+	{ CCI_REG8(0x0383), 0x01 },
+	{ CCI_REG8(0x0385), 0x01 },
+	{ CCI_REG8(0x0387), 0x01 },
+	{ CCI_REG8(0x0900), 0x01 },
+	{ CCI_REG8(0x0901), 0x22 },
+	{ CCI_REG8(0x0902), 0x08 },
+	{ CCI_REG8(0x3f4c), 0x81 },
+	{ CCI_REG8(0x3f4d), 0x81 },
+	{ CCI_REG8(0x0408), 0x00 },
+	{ CCI_REG8(0x0409), 0xc8 },
+	{ CCI_REG8(0x040a), 0x00 },
+	{ CCI_REG8(0x040b), 0x6c },
+	{ CCI_REG8(0x040c), 0x07 },
+	{ CCI_REG8(0x040d), 0x88 },
+	{ CCI_REG8(0x040e), 0x04 },
+	{ CCI_REG8(0x040f), 0x40 },
+	{ CCI_REG8(0x034c), 0x07 },
+	{ CCI_REG8(0x034d), 0x88 },
+	{ CCI_REG8(0x034e), 0x04 },
+	{ CCI_REG8(0x034f), 0x40 },
+	{ CCI_REG8(0x0301), 0x06 },
+	{ CCI_REG8(0x0303), 0x02 },
+	{ CCI_REG8(0x0305), 0x02 },
+	{ CCI_REG8(0x0306), 0x00 },
+	{ CCI_REG8(0x0307), 0x79 },
+	{ CCI_REG8(0x030b), 0x01 },
+	{ CCI_REG8(0x030d), 0x02 },
+	{ CCI_REG8(0x030e), 0x00 },
+	{ CCI_REG8(0x030f), 0x53 },
+	{ CCI_REG8(0x0310), 0x01 },
+	{ CCI_REG8(0x0202), 0x13 },
+	{ CCI_REG8(0x0203), 0x9e },
+	{ CCI_REG8(0x0204), 0x00 },
+	{ CCI_REG8(0x0205), 0x00 },
+	{ CCI_REG8(0x020e), 0x01 },
+	{ CCI_REG8(0x020f), 0x00 },
+	{ CCI_REG8(0x3f78), 0x01 },
+	{ CCI_REG8(0x3f79), 0x31 },
+	{ CCI_REG8(0x3ffe), 0x00 },
+	{ CCI_REG8(0x3fff), 0x8a },
+	{ CCI_REG8(0x5f0a), 0xb6 },
 };
 
 static const char * const imx471_test_pattern_menu[] = {
@@ -282,8 +284,22 @@ static const s64 link_freq_menu_items[] = {
 	IMX471_LINK_FREQ_DEFAULT,
 };
 
+/*
+ * The Bayer formats for the flipping.
+ * - no flip
+ * - h flip
+ * - v flip
+ * - h and v flips
+ */
+static const u32 imx471_mbus_formats[] = {
+	MEDIA_BUS_FMT_SRGGB10_1X10,
+	MEDIA_BUS_FMT_SGRBG10_1X10,
+	MEDIA_BUS_FMT_SGBRG10_1X10,
+	MEDIA_BUS_FMT_SBGGR10_1X10,
+};
+
 /* Mode configs */
-static const struct imx471_mode supported_modes[] = {
+static const struct imx471_mode imx471_modes[] = {
 	{
 		.width = 1928,
 		.height = 1088,
@@ -291,167 +307,88 @@ static const struct imx471_mode supported_modes[] = {
 		.fll_min = 1308,
 		.llp = 2328,
 		.link_freq_index = IMX471_LINK_FREQ_INDEX,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_1928x1088_regs),
-			.regs = mode_1928x1088_regs,
-		},
+		.default_mode_regs = mode_1928x1088_regs,
+		.default_mode_regs_length = ARRAY_SIZE(mode_1928x1088_regs),
 	},
 };
 
-static inline struct imx471 *to_imx471(struct v4l2_subdev *_sd)
+static int imx471_get_regulators(struct device *dev, struct imx471_data *sensor)
 {
-	return container_of(_sd, struct imx471, sd);
-}
+	unsigned int i;
 
-/* Read registers up to 4 at a time */
-static int imx471_read_reg(struct imx471 *imx471, u16 reg, u32 len, u32 *val)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx471->sd);
-	struct i2c_msg msgs[2];
-	u8 addr_buf[2];
-	u8 data_buf[4] = { 0 };
-	int ret;
+	for (i = 0; i < IMX471_NUM_SUPPLIES; i++)
+		sensor->supplies[i].supply = imx471_supply_name[i];
 
-	if (len > 4)
-		return -EINVAL;
-
-	put_unaligned_be16(reg, addr_buf);
-	/* Write register address */
-	msgs[0].addr = client->addr;
-	msgs[0].flags = 0;
-	msgs[0].len = ARRAY_SIZE(addr_buf);
-	msgs[0].buf = addr_buf;
-
-	/* Read data from register */
-	msgs[1].addr = client->addr;
-	msgs[1].flags = I2C_M_RD;
-	msgs[1].len = len;
-	msgs[1].buf = &data_buf[4 - len];
-
-	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	if (ret != ARRAY_SIZE(msgs))
-		return -EIO;
-
-	*val = get_unaligned_be32(data_buf);
-
-	return 0;
-}
-
-/* Write registers up to 4 at a time */
-static int imx471_write_reg(struct imx471 *imx471, u16 reg, u32 len, u32 val)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx471->sd);
-	u8 buf[6];
-
-	if (len > 4)
-		return -EINVAL;
-
-	put_unaligned_be16(reg, buf);
-	put_unaligned_be32(val << (8 * (4 - len)), buf + 2);
-	if (i2c_master_send(client, buf, len + 2) != len + 2)
-		return -EIO;
-
-	return 0;
-}
-
-/* Write a list of registers */
-static int imx471_write_regs(struct imx471 *imx471,
-			     const struct imx471_reg *regs, u32 len)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx471->sd);
-	int ret;
-	u32 i;
-
-	for (i = 0; i < len; i++) {
-		ret = imx471_write_reg(imx471, regs[i].address, 1, regs[i].val);
-		if (ret) {
-			dev_err_ratelimited(&client->dev,
-					    "write reg 0x%4.4x return err %d",
-					    regs[i].address, ret);
-			return ret;
-		}
-	}
-
-	return 0;
-}
-
-/* Open sub-device */
-static int imx471_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
-{
-	struct imx471 *imx471 = to_imx471(sd);
-	struct v4l2_mbus_framefmt *try_fmt =
-		v4l2_subdev_state_get_format(fh->state, 0);
-
-	mutex_lock(&imx471->mutex);
-
-	/* Initialize try_fmt */
-	try_fmt->width = imx471->cur_mode->width;
-	try_fmt->height = imx471->cur_mode->height;
-	try_fmt->code = MEDIA_BUS_FMT_SRGGB10_1X10;
-	try_fmt->field = V4L2_FIELD_NONE;
-
-	mutex_unlock(&imx471->mutex);
-
-	return 0;
+	return devm_regulator_bulk_get(dev, IMX471_NUM_SUPPLIES,
+				       sensor->supplies);
 }
 
 static int imx471_set_ctrl(struct v4l2_ctrl *ctrl)
 {
-	struct imx471 *imx471 = container_of(ctrl->handler,
-					     struct imx471, ctrl_handler);
-	struct i2c_client *client = v4l2_get_subdevdata(&imx471->sd);
-	s64 max;
+	struct imx471_data *sensor = container_of(ctrl->handler,
+						  struct imx471_data,
+						  ctrl_handler);
+	struct v4l2_subdev_state *state =
+			v4l2_subdev_get_locked_active_state(&sensor->sd);
+	const struct v4l2_mbus_framefmt *format =
+			v4l2_subdev_state_get_format(state, 0);
+	s64 exposure_max;
 	int ret;
 
 	/* Propagate change of current control to all related controls */
-	switch (ctrl->id) {
-	case V4L2_CID_VBLANK:
+	if (ctrl->id == V4L2_CID_VBLANK) {
 		/* Update max exposure while meeting expected vblanking */
-		max = imx471->cur_mode->height + ctrl->val - 18;
-		__v4l2_ctrl_modify_range(imx471->exposure,
-					 imx471->exposure->minimum,
-					 max, imx471->exposure->step, max);
-		break;
+		exposure_max =
+			format->height + ctrl->val - IMX471_EXPOSURE_MARGIN;
+		__v4l2_ctrl_modify_range(sensor->exposure,
+					 sensor->exposure->minimum,
+					 exposure_max,
+					 sensor->exposure->step,
+					 exposure_max);
 	}
 
-	/*
-	 * Applying V4L2 control value only happens
-	 * when power is up for streaming
-	 */
-	if (!pm_runtime_get_if_in_use(&client->dev))
+	/* V4L2 controls values will be applied only when power is already up */
+	if (!pm_runtime_get_if_in_use(sensor->dev))
 		return 0;
 
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
-		/* Analog gain = 1024/(1024 - ctrl->val) times */
-		ret = imx471_write_reg(imx471, IMX471_REG_ANALOG_GAIN, 2,
-				       ctrl->val);
+		cci_write(sensor->regmap, IMX471_REG_ANALOG_GAIN,
+			  ctrl->val, &ret);
 		break;
 	case V4L2_CID_DIGITAL_GAIN:
-		ret = imx471_write_reg(imx471, IMX471_REG_DIG_GAIN_GLOBAL, 2,
-				       ctrl->val);
+		cci_write(sensor->regmap, IMX471_REG_DIG_GAIN_GLOBAL,
+			  ctrl->val, &ret);
 		break;
 	case V4L2_CID_EXPOSURE:
-		ret = imx471_write_reg(imx471, IMX471_REG_EXPOSURE, 2,
-				       ctrl->val);
+		cci_write(sensor->regmap, IMX471_REG_EXPOSURE,
+			  ctrl->val, &ret);
 		break;
 	case V4L2_CID_VBLANK:
 		/* Update FLL that meets expected vertical blanking */
-		ret = imx471_write_reg(imx471, IMX471_REG_FLL, 2,
-				       imx471->cur_mode->height + ctrl->val);
+		cci_write(sensor->regmap, IMX471_REG_FLL,
+			  format->height + ctrl->val, &ret);
 		break;
 	case V4L2_CID_TEST_PATTERN:
-		ret = imx471_write_reg(imx471, IMX471_REG_TEST_PATTERN,
-				       2, ctrl->val);
+		cci_write(sensor->regmap, IMX471_REG_TEST_PATTERN,
+			  ctrl->val, &ret);
+		break;
+	case V4L2_CID_HFLIP:
+	case V4L2_CID_VFLIP:
+		if (sensor->streaming)
+			return -EBUSY;
+
+		cci_write(sensor->regmap, IMX471_REG_ORIENTATION,
+			  sensor->hflip->val | sensor->vflip->val << 1, &ret);
 		break;
 	default:
 		ret = -EINVAL;
-		dev_info(&client->dev, "ctrl(id:0x%x,val:0x%x) is not handled",
+		dev_info(sensor->dev, "ctrl(id:0x%x,val:0x%x) is not handled",
 			 ctrl->id, ctrl->val);
 		break;
 	}
 
-	pm_runtime_put(&client->dev);
+	pm_runtime_put(sensor->dev);
 
 	return ret;
 }
@@ -460,151 +397,138 @@ static const struct v4l2_ctrl_ops imx471_ctrl_ops = {
 	.s_ctrl = imx471_set_ctrl,
 };
 
+static u32 imx471_get_format_code(struct imx471_data *seonsor)
+{
+	unsigned int i;
+
+	i = (seonsor->vflip->val ? 2 : 0) | (seonsor->hflip->val ? 1 : 0);
+
+	return imx471_mbus_formats[i];
+}
+
 static int imx471_enum_mbus_code(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_mbus_code_enum *code)
 {
-	struct imx471 *imx471 = to_imx471(sd);
+	struct imx471_data *sensor = to_imx471_data(sd);
 
-	if (code->index > 0)
+	if (code->index >= (ARRAY_SIZE(imx471_mbus_formats) / 4))
 		return -EINVAL;
 
-	mutex_lock(&imx471->mutex);
-	code->code = MEDIA_BUS_FMT_SRGGB10_1X10;
-	mutex_unlock(&imx471->mutex);
+	code->code = imx471_get_format_code(sensor);
 
 	return 0;
 }
-
 static int imx471_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *sd_state,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index >= ARRAY_SIZE(supported_modes))
+	if (fse->index >= ARRAY_SIZE(imx471_modes))
 		return -EINVAL;
 
-	fse->min_width = supported_modes[fse->index].width;
+	fse->min_width = imx471_modes[fse->index].width;
 	fse->max_width = fse->min_width;
-	fse->min_height = supported_modes[fse->index].height;
+	fse->min_height = imx471_modes[fse->index].height;
 	fse->max_height = fse->min_height;
 
 	return 0;
 }
 
-static void imx471_update_pad_format(struct imx471 *imx471,
+static void imx471_update_pad_format(struct imx471_data *sensor,
 				     const struct imx471_mode *mode,
 				     struct v4l2_subdev_format *fmt)
 {
+	fmt->format.code = imx471_get_format_code(sensor);
 	fmt->format.width = mode->width;
 	fmt->format.height = mode->height;
-	fmt->format.code = MEDIA_BUS_FMT_SRGGB10_1X10;
 	fmt->format.field = V4L2_FIELD_NONE;
 }
 
-static int imx471_do_get_pad_format(struct imx471 *imx471,
-				    struct v4l2_subdev_state *sd_state,
-				    struct v4l2_subdev_format *fmt)
-{
-	struct v4l2_mbus_framefmt *framefmt;
-
-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
-		fmt->format = *framefmt;
-	} else {
-		imx471_update_pad_format(imx471, imx471->cur_mode, fmt);
-	}
-
-	return 0;
-}
-
-static int imx471_get_pad_format(struct v4l2_subdev *sd,
+static int imx471_set_pad_format(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_format *fmt)
 {
-	struct imx471 *imx471 = to_imx471(sd);
-	int ret;
-
-	mutex_lock(&imx471->mutex);
-	ret = imx471_do_get_pad_format(imx471, sd_state, fmt);
-	mutex_unlock(&imx471->mutex);
-
-	return ret;
-}
-
-static int
-imx471_set_pad_format(struct v4l2_subdev *sd,
-		      struct v4l2_subdev_state *sd_state,
-		      struct v4l2_subdev_format *fmt)
-{
-	struct imx471 *imx471 = to_imx471(sd);
+	struct imx471_data *sensor = to_imx471_data(sd);
 	const struct imx471_mode *mode;
-	struct v4l2_mbus_framefmt *framefmt;
-	s32 vblank_def;
-	s32 vblank_min;
-	s64 h_blank;
-	u64 pixel_rate;
-	u32 height;
 
-	mutex_lock(&imx471->mutex);
-
-	fmt->format.code = MEDIA_BUS_FMT_SRGGB10_1X10;
-
-	mode = v4l2_find_nearest_size(supported_modes,
-				      ARRAY_SIZE(supported_modes),
+	mode = v4l2_find_nearest_size(imx471_modes,
+				      ARRAY_SIZE(imx471_modes),
 				      width, height,
 				      fmt->format.width, fmt->format.height);
-	imx471_update_pad_format(imx471, mode, fmt);
-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
-		*framefmt = fmt->format;
-	} else {
-		imx471->cur_mode = mode;
+
+	imx471_update_pad_format(sensor, mode, fmt);
+
+	*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
+
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
+		return 0;
+
+	if (media_entity_is_streaming(&sensor->sd.entity))
+		return -EBUSY;
+
+	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+		int h_blank;
+		u64 pixel_rate;
+
 		pixel_rate = IMX471_LINK_FREQ_DEFAULT * 2 * 4;
 		do_div(pixel_rate, 10);
-		__v4l2_ctrl_s_ctrl_int64(imx471->pixel_rate, pixel_rate);
-		/* Update limits and set FPS to default */
-		height = imx471->cur_mode->height;
-		vblank_def = imx471->cur_mode->fll_def - height;
-		vblank_min = imx471->cur_mode->fll_min - height;
-		height = IMX471_FLL_MAX - height;
-		__v4l2_ctrl_modify_range(imx471->vblank, vblank_min, height, 1,
-					 vblank_def);
-		__v4l2_ctrl_s_ctrl(imx471->vblank, vblank_def);
-		h_blank = mode->llp - imx471->cur_mode->width;
+		__v4l2_ctrl_modify_range(sensor->pixel_rate,
+					 V4L2_CID_PIXEL_RATE,
+					 pixel_rate, 1, pixel_rate);
+
+		__v4l2_ctrl_modify_range(sensor->vblank,
+					 mode->fll_min - mode->height,
+					 IMX471_FLL_MAX - mode->height,
+					 1,
+					 mode->fll_def - mode->height);
+
+		h_blank = mode->llp - mode->width;
 		/*
 		 * Currently hblank is not changeable.
 		 * So FPS control is done only by vblank.
 		 */
-		__v4l2_ctrl_modify_range(imx471->hblank, h_blank,
+		__v4l2_ctrl_modify_range(sensor->hblank, h_blank,
 					 h_blank, 1, h_blank);
 	}
-
-	mutex_unlock(&imx471->mutex);
 
 	return 0;
 }
 
-/* Verify chip ID */
-static int imx471_identify_module(struct imx471 *imx471)
+static int imx471_init_state(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *sd_state)
 {
-	struct i2c_client *client = v4l2_get_subdevdata(&imx471->sd);
-	int ret;
-	u32 val;
+	struct v4l2_subdev_format fmt = { };
 
-	if (imx471->identified)
+	fmt.which =
+		sd_state ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
+	fmt.format.code = MEDIA_BUS_FMT_SRGGB10_1X10;
+	fmt.format.width = imx471_modes[0].width;
+	fmt.format.height = imx471_modes[0].height;
+
+	imx471_set_pad_format(sd, sd_state, &fmt);
+
+	return 0;
+}
+
+static int imx471_identify_module(struct imx471_data *sensor)
+{
+	int ret;
+	u64 val;
+
+	if (sensor->identified)
 		return 0;
 
-	ret = imx471_read_reg(imx471, IMX471_REG_CHIP_ID, 2, &val);
+	ret = cci_read(sensor->regmap, IMX471_REG_CHIP_ID, &val, NULL);
 	if (ret)
-		return ret;
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to read chip id\n");
 
-	if (val != IMX471_CHIP_ID) {
-		dev_err(&client->dev, "chip id mismatch: %x!=%x",
-			IMX471_CHIP_ID, val);
-		return -EIO;
-	}
+	if (val != IMX471_CHIP_ID)
+		return dev_err_probe(sensor->dev, -EIO,
+				     "chip id mismatch: %x!=%llx\n",
+				     IMX471_CHIP_ID, val);
 
-	imx471->identified = true;
+	sensor->identified = true;
 
 	return 0;
 }
@@ -612,14 +536,12 @@ static int imx471_identify_module(struct imx471 *imx471)
 static int imx471_power_off(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct imx471 *imx471 = to_imx471(sd);
+	struct imx471_data *sensor = to_imx471_data(sd);
 
-	dev_info(dev, "imx471 power off");
+	clk_disable_unprepare(sensor->img_clk);
+	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
 
-	clk_disable_unprepare(imx471->img_clk);
-	gpiod_set_value_cansleep(imx471->reset_gpio, 1);
-	if (imx471->avdd)
-		regulator_disable(imx471->avdd);
+	regulator_bulk_disable(IMX471_NUM_SUPPLIES, sensor->supplies);
 
 	return 0;
 }
@@ -627,115 +549,112 @@ static int imx471_power_off(struct device *dev)
 static int imx471_power_on(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct imx471 *imx471 = to_imx471(sd);
+	struct imx471_data *sensor = to_imx471_data(sd);
 	int ret;
 
-	dev_info(dev, "start to power on");
-
-	if (imx471->avdd) {
-		ret = regulator_enable(imx471->avdd);
-		if (ret < 0) {
-			dev_err(dev, "failed to enable avdd: %d", ret);
-			return ret;
-		}
+	ret = regulator_bulk_enable(IMX471_NUM_SUPPLIES, sensor->supplies);
+	if (ret < 0) {
+		dev_err(dev, "failed to enable regulators: %d\n", ret);
+		return ret;
 	}
 
-	ret = clk_prepare_enable(imx471->img_clk);
+	ret = clk_prepare_enable(sensor->img_clk);
 	if (ret < 0) {
+		regulator_bulk_disable(IMX471_NUM_SUPPLIES, sensor->supplies);
 		dev_err(dev, "failed to enable imaging clock: %d", ret);
 		return ret;
 	}
 
-	gpiod_set_value_cansleep(imx471->reset_gpio, 0);
+	gpiod_set_value_cansleep(sensor->reset_gpio, 0);
 
-	usleep_range(1000, 1500);
+	usleep_range(10000, 15000);
 
 	return 0;
 }
 
 /* Start streaming */
-static int imx471_start_streaming(struct imx471 *imx471)
+static int imx471_enable_stream(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *state,
+				u32 pad, u64 streams_mask)
 {
-	struct i2c_client *client = v4l2_get_subdevdata(&imx471->sd);
-	const struct imx471_reg_list *reg_list;
+	struct imx471_data *sensor = to_imx471_data(sd);
+	const struct imx471_mode *mode;
+	struct v4l2_mbus_framefmt *fmt;
 	int ret;
 
-	ret = imx471_identify_module(imx471);
+	ret = pm_runtime_resume_and_get(sensor->dev);
+	if (ret)
+		goto error_powerdown;
+
+	ret = imx471_identify_module(sensor);
 	if (ret)
 		return ret;
 
 	/* Global Setting */
-	reg_list = &imx471_global_setting;
-	ret = imx471_write_regs(imx471, reg_list->regs, reg_list->num_of_regs);
+	cci_multi_reg_write(sensor->regmap, imx471_global_regs,
+			    ARRAY_SIZE(imx471_global_regs), &ret);
 	if (ret) {
-		dev_err(&client->dev, "failed to set global settings");
-		return ret;
+		dev_err(sensor->dev, "failed to set global settings");
+		goto error_powerdown;
 	}
 
+	state = v4l2_subdev_get_locked_active_state(&sensor->sd);
+	fmt = v4l2_subdev_state_get_format(state, 0);
+	mode = v4l2_find_nearest_size(imx471_modes, ARRAY_SIZE(imx471_modes),
+				      width, height, fmt->width, fmt->height);
+
 	/* Apply default values of current mode */
-	reg_list = &imx471->cur_mode->reg_list;
-	ret = imx471_write_regs(imx471, reg_list->regs, reg_list->num_of_regs);
+	cci_multi_reg_write(sensor->regmap, mode->default_mode_regs,
+			    mode->default_mode_regs_length, &ret);
 	if (ret) {
-		dev_err(&client->dev, "failed to set mode");
-		return ret;
+		dev_err(sensor->dev, "failed to set mode");
+		goto error_powerdown;
 	}
 
 	/* set digital gain control to all color mode */
-	ret = imx471_write_reg(imx471, IMX471_REG_DPGA_USE_GLOBAL_GAIN, 1, 1);
+	cci_write(sensor->regmap, IMX471_REG_DPGA_USE_GLOBAL_GAIN, 1, &ret);
 	if (ret)
-		return ret;
+		goto error_powerdown;
 
 	/* Apply customized values from user */
-	ret =  __v4l2_ctrl_handler_setup(imx471->sd.ctrl_handler);
+	ret =  __v4l2_ctrl_handler_setup(&sensor->ctrl_handler);
 	if (ret)
-		return ret;
+		goto error_powerdown;
 
-	return imx471_write_reg(imx471, IMX471_REG_MODE_SELECT,
-				1, IMX471_MODE_STREAMING);
+	cci_write(sensor->regmap, IMX471_REG_MODE_SELECT,
+		  IMX471_MODE_STREAMING, &ret);
+	if (ret)
+		goto error_powerdown;
+
+	sensor->streaming = 1;
+
+	return ret;
+
+error_powerdown:
+	pm_runtime_put(sensor->dev);
+
+	return ret;
 }
 
 /* Stop streaming */
-static int imx471_stop_streaming(struct imx471 *imx471)
+static int imx471_disable_stream(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *state,
+				 u32 pad, u64 streams_mask)
 {
-	return imx471_write_reg(imx471, IMX471_REG_MODE_SELECT,
-				1, IMX471_MODE_STANDBY);
-}
+	struct imx471_data *sensor = to_imx471_data(sd);
+	int ret;
 
-static int imx471_set_stream(struct v4l2_subdev *sd, int enable)
-{
-	struct imx471 *imx471 = to_imx471(sd);
-	struct i2c_client *client = v4l2_get_subdevdata(sd);
-	int ret = 0;
+	cci_write(sensor->regmap, IMX471_REG_MODE_SELECT,
+		  IMX471_MODE_STANDBY, &ret);
+	pm_runtime_put(sensor->dev);
+	sensor->streaming = 0;
 
-	mutex_lock(&imx471->mutex);
+	if (ret)
+		dev_err(sensor->dev,
+			"failed to disable stream with return value: %d\n",
+			ret);
 
-	if (enable) {
-		ret = pm_runtime_resume_and_get(&client->dev);
-		if (ret < 0)
-			goto err_unlock;
-
-		/*
-		 * Apply default & customized values
-		 * and then start streaming.
-		 */
-		ret = imx471_start_streaming(imx471);
-		if (ret)
-			goto err_rpm_put;
-	} else {
-		imx471_stop_streaming(imx471);
-		pm_runtime_put(&client->dev);
-	}
-
-	mutex_unlock(&imx471->mutex);
-
-	return ret;
-
-err_rpm_put:
-	pm_runtime_put(&client->dev);
-err_unlock:
-	mutex_unlock(&imx471->mutex);
-
-	return ret;
+	return 0;
 }
 
 static const struct v4l2_subdev_core_ops imx471_subdev_core_ops = {
@@ -744,14 +663,16 @@ static const struct v4l2_subdev_core_ops imx471_subdev_core_ops = {
 };
 
 static const struct v4l2_subdev_video_ops imx471_video_ops = {
-	.s_stream = imx471_set_stream,
+	.s_stream = v4l2_subdev_s_stream_helper,
 };
 
 static const struct v4l2_subdev_pad_ops imx471_pad_ops = {
 	.enum_mbus_code = imx471_enum_mbus_code,
-	.get_fmt = imx471_get_pad_format,
+	.get_fmt = v4l2_subdev_get_fmt,
 	.set_fmt = imx471_set_pad_format,
 	.enum_frame_size = imx471_enum_frame_size,
+	.enable_streams = imx471_enable_stream,
+	.disable_streams = imx471_disable_stream,
 };
 
 static const struct v4l2_subdev_ops imx471_subdev_ops = {
@@ -760,68 +681,73 @@ static const struct v4l2_subdev_ops imx471_subdev_ops = {
 	.pad = &imx471_pad_ops,
 };
 
-static const struct media_entity_operations imx471_subdev_entity_ops = {
-	.link_validate = v4l2_subdev_link_validate,
-};
-
 static const struct v4l2_subdev_internal_ops imx471_internal_ops = {
-	.open = imx471_open,
+	.init_state = imx471_init_state,
 };
 
 /* Initialize control handlers */
-static int imx471_init_controls(struct imx471 *imx471)
+static int imx471_init_controls(struct imx471_data *sensor)
 {
-	struct i2c_client *client = v4l2_get_subdevdata(&imx471->sd);
+	const struct imx471_mode *mode = &imx471_modes[0];
 	struct v4l2_ctrl_handler *ctrl_hdlr;
+	struct v4l2_fwnode_device_properties props;
 	s64 exposure_max;
-	s64 vblank_def;
-	s64 vblank_min;
 	s64 hblank;
 	u64 pixel_rate;
-	const struct imx471_mode *mode;
-	u32 max;
 	int ret;
 
-	ctrl_hdlr = &imx471->ctrl_handler;
+
+	ctrl_hdlr = &sensor->ctrl_handler;
 	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 10);
 	if (ret)
 		return ret;
 
-	ctrl_hdlr->lock = &imx471->mutex;
-	max = ARRAY_SIZE(link_freq_menu_items) - 1;
-	imx471->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx471_ctrl_ops,
-						   V4L2_CID_LINK_FREQ, max, 0,
-						   link_freq_menu_items);
-	if (imx471->link_freq)
-		imx471->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
+	if (ret) {
+		dev_err(sensor->dev, "failed to parse fwnode: %d", ret);
+		return ret;
+	}
+
+	v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &imx471_ctrl_ops, &props);
+	if (ctrl_hdlr->error)
+		return ctrl_hdlr->error;
+
+	sensor->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+					&imx471_ctrl_ops,
+					V4L2_CID_LINK_FREQ,
+					ARRAY_SIZE(link_freq_menu_items) - 1,
+					0,
+					link_freq_menu_items);
+	if (sensor->link_freq)
+		sensor->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/* pixel_rate = link_freq * 2 * nr_of_lanes / bits_per_sample */
 	pixel_rate = IMX471_LINK_FREQ_DEFAULT * 2 * 4;
 	do_div(pixel_rate, 10);
 	/* By default, PIXEL_RATE is read only */
-	imx471->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
+	sensor->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
 					       V4L2_CID_PIXEL_RATE, pixel_rate,
 					       pixel_rate, 1, pixel_rate);
 
 	/* Initial vblank/hblank/exposure parameters based on current mode */
-	mode = imx471->cur_mode;
-	vblank_def = mode->fll_def - mode->height;
-	vblank_min = mode->fll_min - mode->height;
-	imx471->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
-					   V4L2_CID_VBLANK, vblank_min,
+	sensor->vblank = v4l2_ctrl_new_std(ctrl_hdlr,
+					   &imx471_ctrl_ops,
+					   V4L2_CID_VBLANK,
+					   mode->fll_min - mode->height,
 					   IMX471_FLL_MAX - mode->height,
-					   1, vblank_def);
+					   1,
+					   mode->fll_def - mode->height);
 
 	hblank = mode->llp - mode->width;
-	imx471->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
+	sensor->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
 					   V4L2_CID_HBLANK, hblank, hblank,
 					   1, hblank);
-	if (imx471->hblank)
-		imx471->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	if (sensor->hblank)
+		sensor->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/* fll >= exposure time + adjust parameter (default value is 18) */
-	exposure_max = mode->fll_def - 18;
-	imx471->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
+	exposure_max = mode->fll_def - IMX471_EXPOSURE_MARGIN;
+	sensor->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
 					     IMX471_EXPOSURE_MIN, exposure_max,
 					     IMX471_EXPOSURE_STEP,
@@ -840,13 +766,25 @@ static int imx471_init_controls(struct imx471 *imx471)
 				     V4L2_CID_TEST_PATTERN,
 				     ARRAY_SIZE(imx471_test_pattern_menu) - 1,
 				     0, 0, imx471_test_pattern_menu);
+
+	/* HFLIP & VFLIP */
+	sensor->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
+					  V4L2_CID_HFLIP, 0, 1, 1, 0);
+
+	sensor->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
+					  V4L2_CID_VFLIP, 0, 1, 1, 0);
+
+	sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+
 	if (ctrl_hdlr->error) {
 		ret = ctrl_hdlr->error;
-		dev_err(&client->dev, "control init failed: %d", ret);
+		dev_err(sensor->dev, "%s control init failed: %d",
+			__func__, ret);
 		goto error;
 	}
 
-	imx471->sd.ctrl_handler = ctrl_hdlr;
+	sensor->sd.ctrl_handler = ctrl_hdlr;
 
 	return 0;
 
@@ -856,202 +794,155 @@ error:
 	return ret;
 }
 
-static int imx471_get_pm_resources(struct device *dev)
+static int imx471_check_hwcfg(struct imx471_data *sensor)
 {
-	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct imx471 *imx471 = to_imx471(sd);
+	struct v4l2_fwnode_endpoint bus_cfg = {
+		.bus_type = V4L2_MBUS_CSI2_DPHY,
+	};
+	struct fwnode_handle *ep, *fwnode = dev_fwnode(sensor->dev);
+	struct clk *clk;
+	unsigned long link_freq_bitmap;
 	int ret;
 
-	imx471->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(imx471->reset_gpio)) {
-		return dev_err_probe(dev, PTR_ERR(imx471->reset_gpio),
-				     "failed to get reset gpio\n");
-	}
+	clk = devm_v4l2_sensor_clk_get(sensor->dev, NULL);
+	if (IS_ERR(clk))
+		return dev_err_probe(sensor->dev, ret,
+				     "can't get clock frequency\n");
 
-	imx471->avdd = devm_regulator_get_optional(dev, "avdd");
-	if (IS_ERR(imx471->avdd)) {
-		ret = PTR_ERR(imx471->avdd);
-		dev_info(dev, "reg returned %d\n", ret);
-		imx471->avdd = NULL;
-		if (ret != -ENODEV)
-			return dev_err_probe(dev, ret,
-					     "failed to get avdd regulator\n");
-	}
+	if (clk_get_rate(clk) != IMX471_EXT_CLK)
+		return dev_err_probe(sensor->dev, -EINVAL,
+				     "external clock %lu is not supported\n",
+				     clk_get_rate(clk));
 
-	imx471->img_clk = devm_clk_get_optional(dev, NULL);
-	if (IS_ERR(imx471->img_clk))
-		return dev_err_probe(dev, PTR_ERR(imx471->img_clk),
-						     "failed to get imaging clock\n");
+	ep = fwnode_graph_get_endpoint_by_id(fwnode, 0, 0, 0);
+	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
+	fwnode_handle_put(ep);
+	if (ret)
+		return dev_err_probe(sensor->dev, ret,
+				     "parsing endpoint failed");
 
-	return 0;
-}
+	ret = v4l2_link_freq_to_bitmap(sensor->dev, bus_cfg.link_frequencies,
+				       bus_cfg.nr_of_link_frequencies,
+				       link_freq_menu_items,
+				       ARRAY_SIZE(link_freq_menu_items),
+				       &link_freq_bitmap);
 
-static int imx471_check_hwcfg(struct device *dev)
-{
-        struct v4l2_fwnode_endpoint bus_cfg = {
-                .bus_type = V4L2_MBUS_CSI2_DPHY
-        };
-        struct fwnode_handle *ep;
-        struct fwnode_handle *fwnode = dev_fwnode(dev);
-        unsigned int i, j;
-        int ret;
-        u32 ext_clk;
+	if (ret == -ENOENT)
+		goto error_endpoint_free;
 
-        if (!fwnode)
-                return -ENXIO;
+	if (ret == -ENODATA)
+		goto error_endpoint_free;
 
-        ep = fwnode_graph_get_next_endpoint(fwnode, NULL);
-        if (!ep)
-                return -EPROBE_DEFER;
+error_endpoint_free:
+	v4l2_fwnode_endpoint_free(&bus_cfg);
 
-        ret = fwnode_property_read_u32(dev_fwnode(dev), "clock-frequency",
-                                       &ext_clk);
-        if (ret) {
-                dev_err(dev, "can't get clock frequency");
-                return ret;
-        }
-
-        if (ext_clk != IMX471_EXT_CLK) {
-                dev_err(dev, "external clock %d is not supported",
-                        ext_clk);
-                return -EINVAL;
-        }
-
-        ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
-        fwnode_handle_put(ep);
-        if (ret)
-                return ret;
-
-        if (!bus_cfg.nr_of_link_frequencies) {
-                dev_err(dev, "no link frequencies defined");
-                ret = -EINVAL;
-                goto out_err;
-        }
-
-        for (i = 0; i < ARRAY_SIZE(link_freq_menu_items); i++) {
-                for (j = 0; j < bus_cfg.nr_of_link_frequencies; j++) {
-                        if (link_freq_menu_items[i] ==
-                                bus_cfg.link_frequencies[j])
-                                break;
-                }
-
-                if (j == bus_cfg.nr_of_link_frequencies) {
-                        dev_err(dev, "no link frequency %lld supported",
-                                link_freq_menu_items[i]);
-                        ret = -EINVAL;
-                        goto out_err;
-                }
-        }
-
-out_err:
-        v4l2_fwnode_endpoint_free(&bus_cfg);
-
-        return ret;
-}
-
-static int imx471_suspend(struct device *dev)
-{
-	return imx471_power_off(dev);
-}
-
-static int imx471_resume(struct device *dev)
-{
-	return imx471_power_on(dev);
+	return ret;
 }
 
 static int imx471_probe(struct i2c_client *client)
 {
-	struct imx471 *imx471;
-	bool full_power;
+	struct imx471_data *sensor;
 	int ret;
 
+	sensor = devm_kzalloc(&client->dev, sizeof(*sensor), GFP_KERNEL);
+	if (!sensor)
+		return dev_err_probe(&client->dev, -ENOMEM,
+				     "failed to allocate memory\n");
+
+	sensor->dev = &client->dev;
 
 	/* Check HW config */
-	ret = imx471_check_hwcfg(&client->dev);
-	if (ret) {
-		dev_err(&client->dev, "failed to check hwcfg: %d", ret);
-		return ret;
-	}
-
-	imx471 = devm_kzalloc(&client->dev, sizeof(*imx471), GFP_KERNEL);
-	if (!imx471)
-		return -ENOMEM;
-
-	mutex_init(&imx471->mutex);
-
-	/* Initialize subdev */
-	v4l2_i2c_subdev_init(&imx471->sd, client, &imx471_subdev_ops);
-
-	ret = imx471_get_pm_resources(&client->dev);
+	ret = imx471_check_hwcfg(sensor);
 	if (ret)
-		return ret;
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to check hwcfg: %d\n", ret);
 
-	full_power = acpi_dev_state_d0(&client->dev);
-	if (full_power) {
-		ret = imx471_power_on(&client->dev);
-		if (ret) {
-			dev_err(&client->dev, "failed to power on\n");
-			return ret;
-		}
+	ret = imx471_get_regulators(sensor->dev, sensor);
+	if (ret)
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to get regulators\n");
 
-		/* Check module identity */
-		ret = imx471_identify_module(imx471);
-		if (ret) {
-			dev_err(&client->dev, "failed to find sensor: %d", ret);
-			goto error_probe;
-		}
+	sensor->reset_gpio = devm_gpiod_get_optional(sensor->dev, "reset",
+						     GPIOD_OUT_HIGH);
+	if (IS_ERR(sensor->reset_gpio))
+		return dev_err_probe(sensor->dev, PTR_ERR(sensor->reset_gpio),
+				     "failed to get reset gpio\n");
+
+	sensor->img_clk = devm_clk_get_optional(sensor->dev, NULL);
+	if (IS_ERR(sensor->img_clk))
+		return dev_err_probe(sensor->dev, PTR_ERR(sensor->img_clk),
+				     "failed to get imaging clock\n");
+
+	/* Initialize subdev */
+	v4l2_i2c_subdev_init(&sensor->sd, client, &imx471_subdev_ops);
+
+	/* Initialize regmap */
+	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
+	if (IS_ERR(sensor->regmap))
+		return PTR_ERR(sensor->regmap);
+
+	ret = imx471_power_on(sensor->dev);
+	if (ret)
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to power on\n");
+
+	/* Check module identity */
+	ret = imx471_identify_module(sensor);
+	if (ret) {
+		dev_err(&client->dev, "failed to find sensor: %d", ret);
+		goto error_power_off;
 	}
 
-	/* Set default mode to max resolution */
-	imx471->cur_mode = &supported_modes[0];
-
-	ret = imx471_init_controls(imx471);
+	ret = imx471_init_controls(sensor);
 	if (ret) {
-		dev_err(&client->dev, "failed to init controls: %d", ret);
-		goto error_probe;
+		dev_err(sensor->dev, "failed to init controls: %d", ret);
+		goto error_power_off;
 	}
 
 	/* Initialize subdev */
-	imx471->sd.internal_ops = &imx471_internal_ops;
-	imx471->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
-		V4L2_SUBDEV_FL_HAS_EVENTS;
-	imx471->sd.entity.ops = &imx471_subdev_entity_ops;
-	imx471->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
+	sensor->sd.internal_ops = &imx471_internal_ops;
+	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+			    V4L2_SUBDEV_FL_HAS_EVENTS;
+	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
 	/* Initialize source pad */
-	imx471->pad.flags = MEDIA_PAD_FL_SOURCE;
-	ret = media_entity_pads_init(&imx471->sd.entity, 1, &imx471->pad);
+	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
+	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
 	if (ret) {
 		dev_err(&client->dev, "failed to init entity pads: %d", ret);
-		goto error_handler_free;
+		goto error_v4l2_ctrl_handler_free;
 	}
 
-	/* Set the device's state to active if it's in D0 state. */
-	if (full_power)
-		pm_runtime_set_active(&client->dev);
-	pm_runtime_enable(&client->dev);
-	pm_runtime_idle(&client->dev);
-
-	ret = v4l2_async_register_subdev_sensor(&imx471->sd);
-	if (ret < 0)
+	sensor->sd.state_lock = sensor->ctrl_handler.lock;
+	ret = v4l2_subdev_init_finalize(&sensor->sd);
+	if (ret < 0) {
+		dev_err(&client->dev, "failed to init subdev: %d", ret);
 		goto error_media_entity_pm;
+	}
 
-	dev_info(&client->dev, "imx471 probe successfully\n");
+	pm_runtime_set_active(sensor->dev);
+	pm_runtime_enable(sensor->dev);
+	pm_runtime_idle(sensor->dev);
+
+	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
+	if (ret < 0)
+		goto error_v4l2_subdev_cleanup;
+
 	return 0;
 
+error_v4l2_subdev_cleanup:
+	pm_runtime_disable(sensor->dev);
+	pm_runtime_set_suspended(sensor->dev);
+	v4l2_subdev_cleanup(&sensor->sd);
+
 error_media_entity_pm:
-	pm_runtime_disable(&client->dev);
-	pm_runtime_set_suspended(&client->dev);
-	media_entity_cleanup(&imx471->sd.entity);
+	media_entity_cleanup(&sensor->sd.entity);
 
-error_handler_free:
-	v4l2_ctrl_handler_free(imx471->sd.ctrl_handler);
-
-error_probe:
-	mutex_destroy(&imx471->mutex);
+error_v4l2_ctrl_handler_free:
+	v4l2_ctrl_handler_free(sensor->sd.ctrl_handler);
 
 error_power_off:
-	imx471_power_off(&client->dev);
+	imx471_power_off(sensor->dev);
 
 	return ret;
 }
@@ -1059,20 +950,23 @@ error_power_off:
 static void imx471_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct imx471 *imx471 = to_imx471(sd);
+	struct imx471_data *sensor = to_imx471_data(sd);
 
 	v4l2_async_unregister_subdev(sd);
+	v4l2_subdev_cleanup(sd);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(sd->ctrl_handler);
 
 	pm_runtime_disable(&client->dev);
-	pm_runtime_set_suspended(&client->dev);
 
-	mutex_destroy(&imx471->mutex);
+	if (!pm_runtime_status_suspended(sensor->dev)) {
+		imx471_power_off(sensor->dev);
+		pm_runtime_set_suspended(sensor->dev);
+	}
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(imx471_pm_ops, imx471_suspend, imx471_resume,
-				 NULL);
+static DEFINE_RUNTIME_DEV_PM_OPS(imx471_pm_ops, imx471_power_off,
+				 imx471_power_on, NULL);
 
 static const struct acpi_device_id imx471_acpi_ids[] __maybe_unused = {
 	{ "SONY471A" },
@@ -1084,15 +978,15 @@ static struct i2c_driver imx471_i2c_driver = {
 	.driver = {
 		.name = "imx471",
 		.acpi_match_table = ACPI_PTR(imx471_acpi_ids),
-		.pm = pm_ptr(&imx471_pm_ops),
+		.pm = pm_sleep_ptr(&imx471_pm_ops),
 	},
 	.probe = imx471_probe,
 	.remove = imx471_remove,
-	.flags = I2C_DRV_ACPI_WAIVE_D0_PROBE,
 };
 module_i2c_driver(imx471_i2c_driver);
 
 MODULE_AUTHOR("Jimmy Su <jimmy.su@intel.com>");
 MODULE_AUTHOR("Serin Yeh <serin.yeh@intel.com>");
+MODULE_AUTHOR("Kate Hsuan <hpa@redhat.com>");
 MODULE_DESCRIPTION("Sony imx471 sensor driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
