@@ -815,6 +815,9 @@ static int imx471_check_hwcfg(struct imx471_data *sensor)
 				     clk_get_rate(clk));
 
 	ep = fwnode_graph_get_endpoint_by_id(fwnode, 0, 0, 0);
+	if (!ep)
+		return dev_err_probe(sensor->dev, -EPROBE_DEFER,
+				     "endpoint not yet available, deferring probe");
 	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
 	fwnode_handle_put(ep);
 	if (ret)
