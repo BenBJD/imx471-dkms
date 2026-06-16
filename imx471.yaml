@@ -1,0 +1,26 @@
+# imx471.yaml for libcamera Simple IPA
+# SPDX-License-Identifier: CC0-1.0
+# Calibrated from IMX471_AAJH5-D_LNL.aiqb
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096  # TODO: set correct value from sensor datasheet
+  - Awb:
+      maxGainR: 2.18
+      maxGainB: 3.47
+      speed: 0.25
+  - Ccm:
+      ccms:
+        - ct: 6500
+          ccm: [ 
+            1.5, -0.3, -0.2,
+           -0.3,  1.2, -0.1,
+           -0.2, -0.8,  2.5 ]
+  - Adjust:
+      gamma: 2.2
+      contrast: 1.0
+      saturation: 1.0
+  - Agc:
+...

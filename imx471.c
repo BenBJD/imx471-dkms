@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (C) 2025 Intel Corporation
+/*
+ * imx471.c - imx471 sensor driver
+ *
+ * Copyright (C) 2025 Intel Corporation
+ * Copyright (C) 2026 Kate Hsuan <hpa@redhat.com>
+ */
 
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -14,42 +19,31 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
 
-#define IMX471_REG_MODE_SELECT		CCI_REG8(0x0100)
-#define IMX471_MODE_STANDBY		0x00
-#define IMX471_MODE_STREAMING		0x01
+#define IMX471_REG_MODE_SELECT			CCI_REG8(0x0100)
+#define IMX471_MODE_STANDBY			0x00
+#define IMX471_MODE_STREAMING			0x01
 
 /* Chip ID */
-#define IMX471_REG_CHIP_ID		CCI_REG16(0x0016)
-#define IMX471_CHIP_ID			0x0471
+#define IMX471_REG_CHIP_ID			CCI_REG16(0x0016)
+#define IMX471_CHIP_ID				0x0471
 
 /* V_TIMING internal */
-#define IMX471_REG_FLL			CCI_REG16(0x0340)
-#define IMX471_FLL_MAX			0xffff
+#define IMX471_REG_FLL				CCI_REG16(0x0340)
+#define IMX471_FLL_MAX				0xffff
 
 /* Exposure control */
-#define IMX471_REG_EXPOSURE		CCI_REG16(0x0202)
-#define IMX471_EXPOSURE_MIN		1
-#define IMX471_EXPOSURE_STEP		1
-#define IMX471_EXPOSURE_DEFAULT		0x04f6
+#define IMX471_REG_EXPOSURE			CCI_REG16(0x0202)
+#define IMX471_EXPOSURE_MIN			1
+#define IMX471_EXPOSURE_STEP			1
+#define IMX471_EXPOSURE_DEFAULT			1270
 
-/*
- *  the digital control register for all color control looks like:
- *  +-----------------+------------------+
- *  |      [7:0]      |       [15:8]     |
- *  +-----------------+------------------+
- *  |	  0x020f      |       0x020e     |
- *  --------------------------------------
- *  it is used to calculate the digital gain times value(integral + fractional)
- *  the [15:8] bits is the fractional part and [7:0] bits is the integral
- *  calculation equation is:
- *      gain value (unit: times) = REG[15:8] + REG[7:0]/0x100
- *  Only value in 0x0100 ~ 0x0FFF range is allowed.
- *  Analog gain use 10 bits in the registers and allowed range is 0 ~ 960
- */
+/* Default exposure margin */
+#define IMX471_EXPOSURE_MARGIN			18
+
 /* Analog gain control */
 #define IMX471_REG_ANALOG_GAIN			CCI_REG16(0x0204)
 #define IMX471_ANA_GAIN_MIN			0
-#define IMX471_ANA_GAIN_MAX			960
+#define IMX471_ANA_GAIN_MAX			800
 #define IMX471_ANA_GAIN_STEP			1
 #define IMX471_ANA_GAIN_DEFAULT			0
 
@@ -61,21 +55,10 @@
 #define IMX471_DGTL_GAIN_STEP			1
 #define IMX471_DGTL_GAIN_DEFAULT		256
 
-#define IMX471_VALUE_08BIT			1
-
 /* HFLIP and VFLIP control */
 #define IMX471_REG_ORIENTATION			CCI_REG8(0x0101)
 #define IMX471_HFLIP_BIT			BIT(0)
 #define IMX471_VFLIP_BIT			BIT(1)
-
-/* Default exposure margin */
-#define IMX471_EXPOSURE_MARGIN			18
-
-/* Horizontal crop window offset */
-#define IMX471_REG_H_WIN_OFFSET			CCI_REG8(0x0409)
-
-/* Vertical crop window offset */
-#define IMX471_REG_V_WIN_OFFSET			CCI_REG8(0x034b)
 
 /* Test Pattern Control */
 #define IMX471_REG_TEST_PATTERN			CCI_REG8(0x0600)
@@ -90,20 +73,48 @@
 #define IMX471_EXT_CLK				19200000
 #define IMX471_LINK_FREQ_INDEX			0
 
-#define IMX471_NUM_SUPPLIES			1
+/* IMX471 native and active pixel array size */
+#define IMX471_NATIVE_WIDTH			4672
+#define IMX471_NATIVE_HEIGHT			3512
+#define IMX471_PIXEL_ARRAY_LEFT			8
+#define IMX471_PIXEL_ARRAY_TOP			8
+#define IMX471_PIXEL_ARRAY_WIDTH		4656
+#define IMX471_PIXEL_ARRAY_HEIGHT		3496
 
-#define to_imx471_data(_sd) container_of_const(_sd, \
-					       struct imx471_data, sd)
+#define IMX471_REG_EXCK_FREQ			CCI_REG16(0x0136)
+#define IMX471_EXCK_FREQ(n)			((n) * 256)	/* n in MHz */
+
+#define IMX471_REG_CSI_DATA_FORMAT		CCI_REG16(0x0112)
+#define IMX471_CSI_DATA_FORMAT_RAW10		0x0a0a
+
+#define IMX471_REG_CSI_LANE_MODE		CCI_REG8(0x0114)
+#define IMX471_CSI_2_LANE_MODE			1
+#define IMX471_CSI_4_LANE_MODE			3
+
+#define IMX471_REG_X_ADD_STA			CCI_REG16(0x0344)
+#define IMX471_REG_Y_ADD_STA			CCI_REG16(0x0346)
+#define IMX471_REG_X_ADD_END			CCI_REG16(0x0348)
+#define IMX471_REG_Y_ADD_END			CCI_REG16(0x034a)
+#define IMX471_REG_X_OUTPUT_SIZE		CCI_REG16(0x034c)
+#define IMX471_REG_Y_OUTPUT_SIZE		CCI_REG16(0x034e)
+#define IMX471_REG_X_EVEN_INC			CCI_REG8(0x0381)
+#define IMX471_REG_X_ODD_INC			CCI_REG8(0x0383)
+#define IMX471_REG_Y_EVEN_INC			CCI_REG8(0x0385)
+#define IMX471_REG_Y_ODD_INC			CCI_REG8(0x0387)
+
+#define IMX471_REG_DIG_CROP_X_OFFSET		CCI_REG16(0x0408)
+#define IMX471_REG_DIG_CROP_Y_OFFSET		CCI_REG16(0x040a)
+#define IMX471_REG_DIG_CROP_WIDTH		CCI_REG16(0x040c)
+#define IMX471_REG_DIG_CROP_HEIGHT		CCI_REG16(0x040e)
+
+#define to_imx471(_sd) container_of_const(_sd, struct imx471, sd)
 
 static const char * const imx471_supply_name[] = {
 	"avdd",
 };
 
-/* Mode : resolution and related config&values */
 struct imx471_mode {
-	/* Frame width */
 	u32 width;
-	/* Frame height */
 	u32 height;
 
 	/* V-timing */
@@ -113,21 +124,17 @@ struct imx471_mode {
 	/* H-timing */
 	u32 llp;
 
-	/* index of link frequency */
 	u32 link_freq_index;
 
-	/* Default register values */
 	const struct cci_reg_sequence *default_mode_regs;
-	const int default_mode_regs_length;
+	unsigned int default_mode_regs_length;
 };
 
-struct imx471_data {
+struct imx471 {
 	struct v4l2_subdev sd;
 	struct media_pad pad;
 
 	struct v4l2_ctrl_handler ctrl_handler;
-	/* V4L2 Controls */
-	struct v4l2_ctrl *link_freq;
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hblank;
@@ -136,21 +143,15 @@ struct imx471_data {
 	struct v4l2_ctrl *exposure;
 
 	struct gpio_desc *reset_gpio;
-	struct regulator_bulk_data supplies[IMX471_NUM_SUPPLIES];
+	struct regulator_bulk_data supplies[ARRAY_SIZE(imx471_supply_name)];
 	struct clk *img_clk;
 
 	struct device *dev;
 	struct regmap *regmap;
-
-	int streaming;
-
-	/* True if the device has been identified */
-	bool identified;
 };
 
 static const struct cci_reg_sequence imx471_global_regs[] = {
-	{ CCI_REG8(0x0136), 0x13 },
-	{ CCI_REG8(0x0137), 0x33 },
+	{ IMX471_REG_EXCK_FREQ, IMX471_EXCK_FREQ(19.2) },
 	{ CCI_REG8(0x3c7e), 0x08 },
 	{ CCI_REG8(0x3c7f), 0x05 },
 	{ CCI_REG8(0x3e35), 0x00 },
@@ -208,43 +209,23 @@ static const struct cci_reg_sequence imx471_global_regs[] = {
 };
 
 static const struct cci_reg_sequence mode_1928x1088_regs[] = {
-	{ CCI_REG8(0x0101), 0x00 },
-	{ CCI_REG8(0x0112), 0x0a },
-	{ CCI_REG8(0x0113), 0x0a },
-	{ CCI_REG8(0x0114), 0x03 },
-	{ CCI_REG8(0x0342), 0x0a },
-	{ CCI_REG8(0x0343), 0x00 },
-	{ CCI_REG8(0x0340), 0x13 },
-	{ CCI_REG8(0x0341), 0xb0 },
-	{ CCI_REG8(0x0344), 0x00 },
-	{ CCI_REG8(0x0345), 0x00 },
-	{ CCI_REG8(0x0346), 0x01 },
-	{ CCI_REG8(0x0347), 0xbc },
-	{ CCI_REG8(0x0348), 0x12 },
-	{ CCI_REG8(0x0349), 0x2f },
-	{ CCI_REG8(0x034a), 0x0b },
-	{ CCI_REG8(0x034b), 0xeb },
-	{ CCI_REG8(0x0381), 0x01 },
-	{ CCI_REG8(0x0383), 0x01 },
-	{ CCI_REG8(0x0385), 0x01 },
-	{ CCI_REG8(0x0387), 0x01 },
+	{ IMX471_REG_X_ADD_STA, 8 },
+	{ IMX471_REG_Y_ADD_STA, 408 },
+	{ IMX471_REG_X_ADD_END, 4647 },
+	{ IMX471_REG_Y_ADD_END, 3051 },
+	{ IMX471_REG_X_EVEN_INC, 1 },
+	{ IMX471_REG_X_ODD_INC, 1 },
+	{ IMX471_REG_Y_EVEN_INC, 1 },
+	{ IMX471_REG_Y_ODD_INC, 1 },
 	{ CCI_REG8(0x0900), 0x01 },
 	{ CCI_REG8(0x0901), 0x22 },
 	{ CCI_REG8(0x0902), 0x08 },
-	{ CCI_REG8(0x3f4c), 0x81 },
-	{ CCI_REG8(0x3f4d), 0x81 },
-	{ CCI_REG8(0x0408), 0x00 },
-	{ CCI_REG8(0x0409), 0xc8 },
-	{ CCI_REG8(0x040a), 0x00 },
-	{ CCI_REG8(0x040b), 0x6c },
-	{ CCI_REG8(0x040c), 0x07 },
-	{ CCI_REG8(0x040d), 0x88 },
-	{ CCI_REG8(0x040e), 0x04 },
-	{ CCI_REG8(0x040f), 0x40 },
-	{ CCI_REG8(0x034c), 0x07 },
-	{ CCI_REG8(0x034d), 0x88 },
-	{ CCI_REG8(0x034e), 0x04 },
-	{ CCI_REG8(0x034f), 0x40 },
+	{ IMX471_REG_DIG_CROP_X_OFFSET, 208 },
+	{ IMX471_REG_DIG_CROP_Y_OFFSET, 108 },
+	{ IMX471_REG_DIG_CROP_WIDTH, 1928 },
+	{ IMX471_REG_DIG_CROP_HEIGHT, 1088 },
+	{ IMX471_REG_X_OUTPUT_SIZE, 1928 },
+	{ IMX471_REG_Y_OUTPUT_SIZE, 1088 },
 	{ CCI_REG8(0x0301), 0x06 },
 	{ CCI_REG8(0x0303), 0x02 },
 	{ CCI_REG8(0x0305), 0x02 },
@@ -255,12 +236,9 @@ static const struct cci_reg_sequence mode_1928x1088_regs[] = {
 	{ CCI_REG8(0x030e), 0x00 },
 	{ CCI_REG8(0x030f), 0x53 },
 	{ CCI_REG8(0x0310), 0x01 },
-	{ CCI_REG8(0x0202), 0x13 },
-	{ CCI_REG8(0x0203), 0x9e },
-	{ CCI_REG8(0x0204), 0x00 },
-	{ CCI_REG8(0x0205), 0x00 },
-	{ CCI_REG8(0x020e), 0x01 },
-	{ CCI_REG8(0x020f), 0x00 },
+	{ IMX471_REG_EXPOSURE, IMX471_EXPOSURE_DEFAULT },
+	{ CCI_REG8(0x3f4c), 0x81 },
+	{ CCI_REG8(0x3f4d), 0x81 },
 	{ CCI_REG8(0x3f78), 0x01 },
 	{ CCI_REG8(0x3f79), 0x31 },
 	{ CCI_REG8(0x3ffe), 0x00 },
@@ -276,10 +254,6 @@ static const char * const imx471_test_pattern_menu[] = {
 	"Pseudorandom Sequence (PN9)",
 };
 
-/*
- * When adding more than the one below, make sure the disallowed ones will
- * actually be disabled in the LINK_FREQ control.
- */
 static const s64 link_freq_menu_items[] = {
 	IMX471_LINK_FREQ_DEFAULT,
 };
@@ -291,14 +265,13 @@ static const s64 link_freq_menu_items[] = {
  * - v flip
  * - h and v flips
  */
-static const u32 imx471_mbus_formats[] = {
+static const u32 imx471_hv_flips_bayer_order[] = {
 	MEDIA_BUS_FMT_SRGGB10_1X10,
 	MEDIA_BUS_FMT_SGRBG10_1X10,
 	MEDIA_BUS_FMT_SGBRG10_1X10,
 	MEDIA_BUS_FMT_SBGGR10_1X10,
 };
 
-/* Mode configs */
 static const struct imx471_mode imx471_modes[] = {
 	{
 		.width = 1928,
@@ -312,22 +285,20 @@ static const struct imx471_mode imx471_modes[] = {
 	},
 };
 
-static int imx471_get_regulators(struct device *dev, struct imx471_data *sensor)
+static int imx471_get_regulators(struct device *dev, struct imx471 *sensor)
 {
-	unsigned int i;
-
-	for (i = 0; i < IMX471_NUM_SUPPLIES; i++)
+	for (unsigned int i = 0; i < ARRAY_SIZE(imx471_supply_name); i++)
 		sensor->supplies[i].supply = imx471_supply_name[i];
 
-	return devm_regulator_bulk_get(dev, IMX471_NUM_SUPPLIES,
+	return devm_regulator_bulk_get(dev, ARRAY_SIZE(imx471_supply_name),
 				       sensor->supplies);
 }
 
 static int imx471_set_ctrl(struct v4l2_ctrl *ctrl)
 {
-	struct imx471_data *sensor = container_of(ctrl->handler,
-						  struct imx471_data,
-						  ctrl_handler);
+	struct imx471 *sensor = container_of_const(ctrl->handler,
+						   struct imx471,
+						   ctrl_handler);
 	struct v4l2_subdev_state *state =
 			v4l2_subdev_get_locked_active_state(&sensor->sd);
 	const struct v4l2_mbus_framefmt *format =
@@ -335,16 +306,16 @@ static int imx471_set_ctrl(struct v4l2_ctrl *ctrl)
 	s64 exposure_max;
 	int ret;
 
-	/* Propagate change of current control to all related controls */
 	if (ctrl->id == V4L2_CID_VBLANK) {
-		/* Update max exposure while meeting expected vblanking */
 		exposure_max =
 			format->height + ctrl->val - IMX471_EXPOSURE_MARGIN;
-		__v4l2_ctrl_modify_range(sensor->exposure,
-					 sensor->exposure->minimum,
-					 exposure_max,
-					 sensor->exposure->step,
-					 exposure_max);
+		ret = __v4l2_ctrl_modify_range(sensor->exposure,
+					       sensor->exposure->minimum,
+					       exposure_max,
+					       sensor->exposure->step,
+					       exposure_max);
+		if (ret)
+			return ret;
 	}
 
 	/* V4L2 controls values will be applied only when power is already up */
@@ -353,33 +324,30 @@ static int imx471_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
-		cci_write(sensor->regmap, IMX471_REG_ANALOG_GAIN,
-			  ctrl->val, &ret);
+		ret = cci_write(sensor->regmap, IMX471_REG_ANALOG_GAIN,
+				ctrl->val, NULL);
 		break;
 	case V4L2_CID_DIGITAL_GAIN:
-		cci_write(sensor->regmap, IMX471_REG_DIG_GAIN_GLOBAL,
-			  ctrl->val, &ret);
+		ret = cci_write(sensor->regmap, IMX471_REG_DIG_GAIN_GLOBAL,
+				ctrl->val, NULL);
 		break;
 	case V4L2_CID_EXPOSURE:
-		cci_write(sensor->regmap, IMX471_REG_EXPOSURE,
-			  ctrl->val, &ret);
+		ret = cci_write(sensor->regmap, IMX471_REG_EXPOSURE,
+				ctrl->val, &ret);
 		break;
 	case V4L2_CID_VBLANK:
 		/* Update FLL that meets expected vertical blanking */
-		cci_write(sensor->regmap, IMX471_REG_FLL,
-			  format->height + ctrl->val, &ret);
+		ret = cci_write(sensor->regmap, IMX471_REG_FLL,
+				format->height + ctrl->val, &ret);
 		break;
 	case V4L2_CID_TEST_PATTERN:
-		cci_write(sensor->regmap, IMX471_REG_TEST_PATTERN,
-			  ctrl->val, &ret);
+		ret = cci_write(sensor->regmap, IMX471_REG_TEST_PATTERN,
+				ctrl->val, NULL);
 		break;
 	case V4L2_CID_HFLIP:
 	case V4L2_CID_VFLIP:
-		if (sensor->streaming)
-			return -EBUSY;
-
-		cci_write(sensor->regmap, IMX471_REG_ORIENTATION,
-			  sensor->hflip->val | sensor->vflip->val << 1, &ret);
+		ret = cci_write(sensor->regmap, IMX471_REG_ORIENTATION,
+				sensor->hflip->val | sensor->vflip->val << 1, NULL);
 		break;
 	default:
 		ret = -EINVAL;
@@ -397,28 +365,29 @@ static const struct v4l2_ctrl_ops imx471_ctrl_ops = {
 	.s_ctrl = imx471_set_ctrl,
 };
 
-static u32 imx471_get_format_code(struct imx471_data *seonsor)
+static u32 imx471_get_format_code(struct imx471 *sensor)
 {
 	unsigned int i;
 
-	i = (seonsor->vflip->val ? 2 : 0) | (seonsor->hflip->val ? 1 : 0);
+	i = (sensor->vflip->val ? 2 : 0) | (sensor->hflip->val ? 1 : 0);
 
-	return imx471_mbus_formats[i];
+	return imx471_hv_flips_bayer_order[i];
 }
 
 static int imx471_enum_mbus_code(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_mbus_code_enum *code)
 {
-	struct imx471_data *sensor = to_imx471_data(sd);
+	struct imx471 *sensor = to_imx471(sd);
 
-	if (code->index >= (ARRAY_SIZE(imx471_mbus_formats) / 4))
+	if (code->index >= (ARRAY_SIZE(imx471_hv_flips_bayer_order) / 4))
 		return -EINVAL;
 
 	code->code = imx471_get_format_code(sensor);
 
 	return 0;
 }
+
 static int imx471_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *sd_state,
 				  struct v4l2_subdev_frame_size_enum *fse)
@@ -434,7 +403,7 @@ static int imx471_enum_frame_size(struct v4l2_subdev *sd,
 	return 0;
 }
 
-static void imx471_update_pad_format(struct imx471_data *sensor,
+static void imx471_update_pad_format(struct imx471 *sensor,
 				     const struct imx471_mode *mode,
 				     struct v4l2_subdev_format *fmt)
 {
@@ -448,8 +417,11 @@ static int imx471_set_pad_format(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_format *fmt)
 {
-	struct imx471_data *sensor = to_imx471_data(sd);
+	struct imx471 *sensor = to_imx471(sd);
 	const struct imx471_mode *mode;
+	u64 pixel_rate;
+	int h_blank;
+	int ret;
 
 	mode = v4l2_find_nearest_size(imx471_modes,
 				      ARRAY_SIZE(imx471_modes),
@@ -466,57 +438,77 @@ static int imx471_set_pad_format(struct v4l2_subdev *sd,
 	if (media_entity_is_streaming(&sensor->sd.entity))
 		return -EBUSY;
 
-	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
-		int h_blank;
-		u64 pixel_rate;
+	pixel_rate = div_u64(IMX471_LINK_FREQ_DEFAULT * 2 * 4, 10);
+	ret = __v4l2_ctrl_modify_range(sensor->pixel_rate,
+				       V4L2_CID_PIXEL_RATE,
+				       pixel_rate, 1, pixel_rate);
+	if (ret)
+		return ret;
 
-		pixel_rate = IMX471_LINK_FREQ_DEFAULT * 2 * 4;
-		do_div(pixel_rate, 10);
-		__v4l2_ctrl_modify_range(sensor->pixel_rate,
-					 V4L2_CID_PIXEL_RATE,
-					 pixel_rate, 1, pixel_rate);
+	ret = __v4l2_ctrl_modify_range(sensor->vblank,
+				       mode->fll_min - mode->height,
+				       IMX471_FLL_MAX - mode->height,
+				       1,
+				       mode->fll_def - mode->height);
+	if (ret)
+		return ret;
 
-		__v4l2_ctrl_modify_range(sensor->vblank,
-					 mode->fll_min - mode->height,
-					 IMX471_FLL_MAX - mode->height,
-					 1,
-					 mode->fll_def - mode->height);
+	h_blank = mode->llp - mode->width;
+	/*
+	 * Currently hblank is not changeable.
+	 * So FPS control is done only by vblank.
+	 */
+	return __v4l2_ctrl_modify_range(sensor->hblank, h_blank,
+					h_blank, 1, h_blank);
+}
 
-		h_blank = mode->llp - mode->width;
-		/*
-		 * Currently hblank is not changeable.
-		 * So FPS control is done only by vblank.
-		 */
-		__v4l2_ctrl_modify_range(sensor->hblank, h_blank,
-					 h_blank, 1, h_blank);
+static int imx471_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+		sel->r = *v4l2_subdev_state_get_crop(sd_state, sel->pad);
+		break;
+
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.top = 0;
+		sel->r.left = 0;
+		sel->r.width = IMX471_NATIVE_WIDTH;
+		sel->r.height = IMX471_NATIVE_HEIGHT;
+		return 0;
+
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.top = IMX471_PIXEL_ARRAY_TOP;
+		sel->r.left = IMX471_PIXEL_ARRAY_LEFT;
+		sel->r.width = IMX471_PIXEL_ARRAY_WIDTH;
+		sel->r.height = IMX471_PIXEL_ARRAY_HEIGHT;
+		return 0;
 	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static int imx471_init_state(struct v4l2_subdev *sd,
 			     struct v4l2_subdev_state *sd_state)
 {
-	struct v4l2_subdev_format fmt = { };
+	struct v4l2_subdev_format fmt = {
+		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+		.format = {
+			.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+			.width = imx471_modes[0].width,
+			.height = imx471_modes[0].height,
+		},
+	};
 
-	fmt.which =
-		sd_state ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
-	fmt.format.code = MEDIA_BUS_FMT_SRGGB10_1X10;
-	fmt.format.width = imx471_modes[0].width;
-	fmt.format.height = imx471_modes[0].height;
-
-	imx471_set_pad_format(sd, sd_state, &fmt);
-
-	return 0;
+	return imx471_set_pad_format(sd, sd_state, &fmt);
 }
 
-static int imx471_identify_module(struct imx471_data *sensor)
+static int imx471_identify_module(struct imx471 *sensor)
 {
 	int ret;
 	u64 val;
-
-	if (sensor->identified)
-		return 0;
 
 	ret = cci_read(sensor->regmap, IMX471_REG_CHIP_ID, &val, NULL);
 	if (ret)
@@ -528,20 +520,18 @@ static int imx471_identify_module(struct imx471_data *sensor)
 				     "chip id mismatch: %x!=%llx\n",
 				     IMX471_CHIP_ID, val);
 
-	sensor->identified = true;
-
 	return 0;
 }
 
 static int imx471_power_off(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct imx471_data *sensor = to_imx471_data(sd);
+	struct imx471 *sensor = to_imx471(sd);
 
 	clk_disable_unprepare(sensor->img_clk);
 	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
 
-	regulator_bulk_disable(IMX471_NUM_SUPPLIES, sensor->supplies);
+	regulator_bulk_disable(ARRAY_SIZE(imx471_supply_name), sensor->supplies);
 
 	return 0;
 }
@@ -549,10 +539,10 @@ static int imx471_power_off(struct device *dev)
 static int imx471_power_on(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct imx471_data *sensor = to_imx471_data(sd);
+	struct imx471 *sensor = to_imx471(sd);
 	int ret;
 
-	ret = regulator_bulk_enable(IMX471_NUM_SUPPLIES, sensor->supplies);
+	ret = regulator_bulk_enable(ARRAY_SIZE(imx471_supply_name), sensor->supplies);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable regulators: %d\n", ret);
 		return ret;
@@ -560,7 +550,7 @@ static int imx471_power_on(struct device *dev)
 
 	ret = clk_prepare_enable(sensor->img_clk);
 	if (ret < 0) {
-		regulator_bulk_disable(IMX471_NUM_SUPPLIES, sensor->supplies);
+		regulator_bulk_disable(ARRAY_SIZE(imx471_supply_name), sensor->supplies);
 		dev_err(dev, "failed to enable imaging clock: %d", ret);
 		return ret;
 	}
@@ -572,29 +562,27 @@ static int imx471_power_on(struct device *dev)
 	return 0;
 }
 
-/* Start streaming */
 static int imx471_enable_stream(struct v4l2_subdev *sd,
 				struct v4l2_subdev_state *state,
 				u32 pad, u64 streams_mask)
 {
-	struct imx471_data *sensor = to_imx471_data(sd);
+	struct imx471 *sensor = to_imx471(sd);
 	const struct imx471_mode *mode;
 	struct v4l2_mbus_framefmt *fmt;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(sensor->dev);
 	if (ret)
-		goto error_powerdown;
+		return ret;
 
 	ret = imx471_identify_module(sensor);
 	if (ret)
 		return ret;
 
-	/* Global Setting */
-	cci_multi_reg_write(sensor->regmap, imx471_global_regs,
-			    ARRAY_SIZE(imx471_global_regs), &ret);
+	ret = cci_multi_reg_write(sensor->regmap, imx471_global_regs,
+				  ARRAY_SIZE(imx471_global_regs), NULL);
 	if (ret) {
-		dev_err(sensor->dev, "failed to set global settings");
+		dev_err(sensor->dev, "failed to set global settings: %d", ret);
 		goto error_powerdown;
 	}
 
@@ -603,30 +591,28 @@ static int imx471_enable_stream(struct v4l2_subdev *sd,
 	mode = v4l2_find_nearest_size(imx471_modes, ARRAY_SIZE(imx471_modes),
 				      width, height, fmt->width, fmt->height);
 
-	/* Apply default values of current mode */
-	cci_multi_reg_write(sensor->regmap, mode->default_mode_regs,
-			    mode->default_mode_regs_length, &ret);
+	ret = cci_multi_reg_write(sensor->regmap, mode->default_mode_regs,
+				  mode->default_mode_regs_length, NULL);
 	if (ret) {
-		dev_err(sensor->dev, "failed to set mode");
+		dev_err(sensor->dev, "failed to set mode: %d", ret);
 		goto error_powerdown;
 	}
 
-	/* set digital gain control to all color mode */
-	cci_write(sensor->regmap, IMX471_REG_DPGA_USE_GLOBAL_GAIN, 1, &ret);
+	ret = cci_write(sensor->regmap, IMX471_REG_DPGA_USE_GLOBAL_GAIN, 1, NULL);
 	if (ret)
 		goto error_powerdown;
 
-	/* Apply customized values from user */
-	ret =  __v4l2_ctrl_handler_setup(&sensor->ctrl_handler);
+	ret = __v4l2_ctrl_handler_setup(&sensor->ctrl_handler);
 	if (ret)
 		goto error_powerdown;
 
-	cci_write(sensor->regmap, IMX471_REG_MODE_SELECT,
-		  IMX471_MODE_STREAMING, &ret);
+	ret = cci_write(sensor->regmap, IMX471_REG_MODE_SELECT,
+			IMX471_MODE_STREAMING, NULL);
 	if (ret)
 		goto error_powerdown;
 
-	sensor->streaming = 1;
+	__v4l2_ctrl_grab(sensor->vflip, true);
+	__v4l2_ctrl_grab(sensor->hflip, true);
 
 	return ret;
 
@@ -636,31 +622,27 @@ error_powerdown:
 	return ret;
 }
 
-/* Stop streaming */
 static int imx471_disable_stream(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *state,
 				 u32 pad, u64 streams_mask)
 {
-	struct imx471_data *sensor = to_imx471_data(sd);
+	struct imx471 *sensor = to_imx471(sd);
 	int ret;
 
-	cci_write(sensor->regmap, IMX471_REG_MODE_SELECT,
-		  IMX471_MODE_STANDBY, &ret);
+	ret = cci_write(sensor->regmap, IMX471_REG_MODE_SELECT,
+			IMX471_MODE_STANDBY, NULL);
 	pm_runtime_put(sensor->dev);
-	sensor->streaming = 0;
 
 	if (ret)
 		dev_err(sensor->dev,
 			"failed to disable stream with return value: %d\n",
 			ret);
 
+	__v4l2_ctrl_grab(sensor->vflip, false);
+	__v4l2_ctrl_grab(sensor->hflip, false);
+
 	return 0;
 }
-
-static const struct v4l2_subdev_core_ops imx471_subdev_core_ops = {
-	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
-	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
-};
 
 static const struct v4l2_subdev_video_ops imx471_video_ops = {
 	.s_stream = v4l2_subdev_s_stream_helper,
@@ -670,13 +652,13 @@ static const struct v4l2_subdev_pad_ops imx471_pad_ops = {
 	.enum_mbus_code = imx471_enum_mbus_code,
 	.get_fmt = v4l2_subdev_get_fmt,
 	.set_fmt = imx471_set_pad_format,
+	.get_selection = imx471_get_selection,
 	.enum_frame_size = imx471_enum_frame_size,
 	.enable_streams = imx471_enable_stream,
 	.disable_streams = imx471_disable_stream,
 };
 
 static const struct v4l2_subdev_ops imx471_subdev_ops = {
-	.core = &imx471_subdev_core_ops,
 	.video = &imx471_video_ops,
 	.pad = &imx471_pad_ops,
 };
@@ -685,22 +667,18 @@ static const struct v4l2_subdev_internal_ops imx471_internal_ops = {
 	.init_state = imx471_init_state,
 };
 
-/* Initialize control handlers */
-static int imx471_init_controls(struct imx471_data *sensor)
+static int imx471_init_controls(struct imx471 *sensor)
 {
 	const struct imx471_mode *mode = &imx471_modes[0];
-	struct v4l2_ctrl_handler *ctrl_hdlr;
 	struct v4l2_fwnode_device_properties props;
-	s64 exposure_max;
-	s64 hblank;
+	struct v4l2_ctrl_handler *ctrl_hdlr;
+	struct v4l2_ctrl *link_freq;
+	s64 exposure_max, hblank;
 	u64 pixel_rate;
 	int ret;
 
-
 	ctrl_hdlr = &sensor->ctrl_handler;
-	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 10);
-	if (ret)
-		return ret;
+	v4l2_ctrl_handler_init(ctrl_hdlr, 12);
 
 	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
 	if (ret) {
@@ -709,27 +687,21 @@ static int imx471_init_controls(struct imx471_data *sensor)
 	}
 
 	v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &imx471_ctrl_ops, &props);
-	if (ctrl_hdlr->error)
-		return ctrl_hdlr->error;
 
-	sensor->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr,
-					&imx471_ctrl_ops,
-					V4L2_CID_LINK_FREQ,
-					ARRAY_SIZE(link_freq_menu_items) - 1,
-					0,
-					link_freq_menu_items);
-	if (sensor->link_freq)
-		sensor->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+					   &imx471_ctrl_ops,
+					   V4L2_CID_LINK_FREQ,
+					   ARRAY_SIZE(link_freq_menu_items) - 1,
+					   0,
+					   link_freq_menu_items);
 
 	/* pixel_rate = link_freq * 2 * nr_of_lanes / bits_per_sample */
-	pixel_rate = IMX471_LINK_FREQ_DEFAULT * 2 * 4;
-	do_div(pixel_rate, 10);
-	/* By default, PIXEL_RATE is read only */
+	pixel_rate = div_u64(IMX471_LINK_FREQ_DEFAULT * 2 * 4, 10);
+
 	sensor->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
 					       V4L2_CID_PIXEL_RATE, pixel_rate,
 					       pixel_rate, 1, pixel_rate);
 
-	/* Initial vblank/hblank/exposure parameters based on current mode */
 	sensor->vblank = v4l2_ctrl_new_std(ctrl_hdlr,
 					   &imx471_ctrl_ops,
 					   V4L2_CID_VBLANK,
@@ -742,8 +714,6 @@ static int imx471_init_controls(struct imx471_data *sensor)
 	sensor->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
 					   V4L2_CID_HBLANK, hblank, hblank,
 					   1, hblank);
-	if (sensor->hblank)
-		sensor->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/* fll >= exposure time + adjust parameter (default value is 18) */
 	exposure_max = mode->fll_def - IMX471_EXPOSURE_MARGIN;
@@ -757,7 +727,6 @@ static int imx471_init_controls(struct imx471_data *sensor)
 			  IMX471_ANA_GAIN_MIN, IMX471_ANA_GAIN_MAX,
 			  IMX471_ANA_GAIN_STEP, IMX471_ANA_GAIN_DEFAULT);
 
-	/* Digital gain */
 	v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
 			  IMX471_DGTL_GAIN_MIN, IMX471_DGTL_GAIN_MAX,
 			  IMX471_DGTL_GAIN_STEP, IMX471_DGTL_GAIN_DEFAULT);
@@ -767,22 +736,22 @@ static int imx471_init_controls(struct imx471_data *sensor)
 				     ARRAY_SIZE(imx471_test_pattern_menu) - 1,
 				     0, 0, imx471_test_pattern_menu);
 
-	/* HFLIP & VFLIP */
 	sensor->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
 					  V4L2_CID_HFLIP, 0, 1, 1, 0);
 
 	sensor->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx471_ctrl_ops,
 					  V4L2_CID_VFLIP, 0, 1, 1, 0);
 
-	sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
-	sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
-
 	if (ctrl_hdlr->error) {
-		ret = ctrl_hdlr->error;
 		dev_err(sensor->dev, "%s control init failed: %d",
-			__func__, ret);
+			__func__, ctrl_hdlr->error);
 		goto error;
 	}
+
+	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	sensor->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
 
 	sensor->sd.ctrl_handler = ctrl_hdlr;
 
@@ -791,22 +760,22 @@ static int imx471_init_controls(struct imx471_data *sensor)
 error:
 	v4l2_ctrl_handler_free(ctrl_hdlr);
 
-	return ret;
+	return ctrl_hdlr->error;
 }
 
-static int imx471_check_hwcfg(struct imx471_data *sensor)
+static int imx471_check_hwcfg(struct imx471 *sensor)
 {
 	struct v4l2_fwnode_endpoint bus_cfg = {
 		.bus_type = V4L2_MBUS_CSI2_DPHY,
 	};
 	struct fwnode_handle *ep, *fwnode = dev_fwnode(sensor->dev);
-	struct clk *clk;
 	unsigned long link_freq_bitmap;
+	struct clk *clk;
 	int ret;
 
 	clk = devm_v4l2_sensor_clk_get(sensor->dev, NULL);
 	if (IS_ERR(clk))
-		return dev_err_probe(sensor->dev, ret,
+		return dev_err_probe(sensor->dev, PTR_ERR(clk),
 				     "can't get clock frequency\n");
 
 	if (clk_get_rate(clk) != IMX471_EXT_CLK)
@@ -830,13 +799,6 @@ static int imx471_check_hwcfg(struct imx471_data *sensor)
 				       ARRAY_SIZE(link_freq_menu_items),
 				       &link_freq_bitmap);
 
-	if (ret == -ENOENT)
-		goto error_endpoint_free;
-
-	if (ret == -ENODATA)
-		goto error_endpoint_free;
-
-error_endpoint_free:
 	v4l2_fwnode_endpoint_free(&bus_cfg);
 
 	return ret;
@@ -844,7 +806,7 @@ error_endpoint_free:
 
 static int imx471_probe(struct i2c_client *client)
 {
-	struct imx471_data *sensor;
+	struct imx471 *sensor;
 	int ret;
 
 	sensor = devm_kzalloc(&client->dev, sizeof(*sensor), GFP_KERNEL);
@@ -854,7 +816,6 @@ static int imx471_probe(struct i2c_client *client)
 
 	sensor->dev = &client->dev;
 
-	/* Check HW config */
 	ret = imx471_check_hwcfg(sensor);
 	if (ret)
 		return dev_err_probe(sensor->dev, ret,
@@ -876,60 +837,56 @@ static int imx471_probe(struct i2c_client *client)
 		return dev_err_probe(sensor->dev, PTR_ERR(sensor->img_clk),
 				     "failed to get imaging clock\n");
 
-	/* Initialize subdev */
 	v4l2_i2c_subdev_init(&sensor->sd, client, &imx471_subdev_ops);
 
-	/* Initialize regmap */
 	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
 	if (IS_ERR(sensor->regmap))
-		return PTR_ERR(sensor->regmap);
+		return dev_err_probe(sensor->dev, PTR_ERR(sensor->regmap),
+				     "failed to initialize CCI\n");
 
 	ret = imx471_power_on(sensor->dev);
 	if (ret)
 		return dev_err_probe(sensor->dev, ret,
 				     "failed to power on\n");
 
-	/* Check module identity */
 	ret = imx471_identify_module(sensor);
 	if (ret) {
-		dev_err(&client->dev, "failed to find sensor: %d", ret);
+		dev_err_probe(sensor->dev, ret, "failed to find sensor: %d", ret);
 		goto error_power_off;
 	}
 
 	ret = imx471_init_controls(sensor);
 	if (ret) {
-		dev_err(sensor->dev, "failed to init controls: %d", ret);
+		dev_err_probe(sensor->dev, ret, "failed to init controls: %d", ret);
 		goto error_power_off;
 	}
 
-	/* Initialize subdev */
 	sensor->sd.internal_ops = &imx471_internal_ops;
-	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
-			    V4L2_SUBDEV_FL_HAS_EVENTS;
+	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
 	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
-	/* Initialize source pad */
-	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
 	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
 	if (ret) {
-		dev_err(&client->dev, "failed to init entity pads: %d", ret);
+		dev_err_probe(sensor->dev, ret, "failed to init entity pads: %d", ret);
 		goto error_v4l2_ctrl_handler_free;
 	}
 
 	sensor->sd.state_lock = sensor->ctrl_handler.lock;
 	ret = v4l2_subdev_init_finalize(&sensor->sd);
 	if (ret < 0) {
-		dev_err(&client->dev, "failed to init subdev: %d", ret);
+		dev_err_probe(sensor->dev, ret, "failed to init subdev: %d", ret);
 		goto error_media_entity_pm;
 	}
 
 	pm_runtime_set_active(sensor->dev);
 	pm_runtime_enable(sensor->dev);
-	pm_runtime_idle(sensor->dev);
 
 	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
 	if (ret < 0)
 		goto error_v4l2_subdev_cleanup;
+
+	pm_runtime_idle(sensor->dev);
 
 	return 0;
 
@@ -953,7 +910,6 @@ error_power_off:
 static void imx471_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct imx471_data *sensor = to_imx471_data(sd);
 
 	v4l2_async_unregister_subdev(sd);
 	v4l2_subdev_cleanup(sd);
@@ -962,9 +918,9 @@ static void imx471_remove(struct i2c_client *client)
 
 	pm_runtime_disable(&client->dev);
 
-	if (!pm_runtime_status_suspended(sensor->dev)) {
-		imx471_power_off(sensor->dev);
-		pm_runtime_set_suspended(sensor->dev);
+	if (!pm_runtime_status_suspended(&client->dev)) {
+		imx471_power_off(&client->dev);
+		pm_runtime_set_suspended(&client->dev);
 	}
 }
 
@@ -973,6 +929,7 @@ static DEFINE_RUNTIME_DEV_PM_OPS(imx471_pm_ops, imx471_power_off,
 
 static const struct acpi_device_id imx471_acpi_ids[] __maybe_unused = {
 	{ "SONY471A" },
+	{ "TBE20A0" },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(acpi, imx471_acpi_ids);
