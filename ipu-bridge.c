@@ -136,7 +136,14 @@ static const struct dmi_system_id upside_down_sensor_dmi_ids[] = {
 		},
 		.driver_data = "OVTI02C1",
 	},
-		{
+	/*
+	 * The first four characters of DMI_BOARD_NAME identify the Lenovo
+	 * machine type/model. For example, a DMI_BOARD_NAME starting with
+	 * "21Q6" indicates a ThinkPad X9-15.
+	 *
+	 * Reference: https://psref.lenovo.com/
+	 */
+	{
 		/* Lenovo X9-14 */
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
