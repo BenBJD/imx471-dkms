@@ -8,16 +8,16 @@ algorithms:
   - BlackLevel:
       blackLevel: 4096  # TODO: set correct value from sensor datasheet
   - Awb:
-      maxGainR: 2.18
-      maxGainB: 3.47
+      maxGainR: 4.00
+      maxGainB: 7.00
       speed: 0.25
   - Ccm:
       ccms:
-        - ct: 6500
+        - ct: 4500
           ccm: [ 
-            1.5, -0.3, -0.2,
-           -0.3,  1.2, -0.1,
-           -0.2, -0.8,  2.5 ]
+            1.95, -0.45, -0.35, 
+            -0.40, 0.95, -0.05,
+            -0.20, -0.50, 2.00 ]
   - Adjust:
       gamma: 2.2
       contrast: 1.0
