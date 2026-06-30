@@ -117,7 +117,7 @@
 #define to_imx471(_sd) container_of_const(_sd, struct imx471, sd)
 
 static const char * const imx471_supply_name[] = {
-	"vana",
+	"avdd",
 };
 
 struct imx471_mode {
