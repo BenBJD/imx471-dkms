@@ -12,11 +12,9 @@
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
-#include <linux/unaligned.h>
 #include <media/v4l2-cci.h>
 #include <media/v4l2-ctrls.h>
-#include <media/v4l2-device.h>
-#include <media/v4l2-event.h>
+#include <media/v4l2-subdev.h>
 #include <media/v4l2-fwnode.h>
 
 #define IMX471_REG_MODE_SELECT			CCI_REG8(0x0100)
@@ -57,21 +55,13 @@
 
 /* HFLIP and VFLIP control */
 #define IMX471_REG_ORIENTATION			CCI_REG8(0x0101)
-#define IMX471_HFLIP_BIT			BIT(0)
-#define IMX471_VFLIP_BIT			BIT(1)
 
 /* Test Pattern Control */
 #define IMX471_REG_TEST_PATTERN			CCI_REG8(0x0600)
-#define IMX471_TEST_PATTERN_DISABLED		0
-#define IMX471_TEST_PATTERN_SOLID_COLOR		1
-#define IMX471_TEST_PATTERN_COLOR_BARS		2
-#define IMX471_TEST_PATTERN_GRAY_COLOR_BARS	3
-#define IMX471_TEST_PATTERN_PN9			4
 
 /* default link frequency and external clock */
 #define IMX471_LINK_FREQ_DEFAULT		200000000LL
 #define IMX471_EXT_CLK				19200000
-#define IMX471_LINK_FREQ_INDEX			0
 
 /* PLL */
 #define IMX471_REG_VTPXCK_DIV			CCI_REG8(0x0301)
@@ -93,7 +83,6 @@
 #define IMX471_PIXEL_ARRAY_HEIGHT		3496
 
 #define IMX471_REG_EXCK_FREQ			CCI_REG16(0x0136)
-#define IMX471_EXCK_FREQ(n)			((n) * 256)	/* n in MHz */
 
 #define IMX471_REG_CSI_DATA_FORMAT		CCI_REG16(0x0112)
 #define IMX471_CSI_DATA_FORMAT_RAW10		0x0a0a
@@ -128,7 +117,7 @@
 #define to_imx471(_sd) container_of_const(_sd, struct imx471, sd)
 
 static const char * const imx471_supply_name[] = {
-	"avdd",
+	"vana",
 };
 
 struct imx471_mode {
@@ -141,8 +130,6 @@ struct imx471_mode {
 
 	/* H-timing */
 	u32 llp;
-
-	u32 link_freq_index;
 
 	const struct cci_reg_sequence *default_mode_regs;
 	unsigned int default_mode_regs_length;
@@ -168,7 +155,7 @@ struct imx471 {
 };
 
 static const struct cci_reg_sequence imx471_global_regs[] = {
-	{ IMX471_REG_EXCK_FREQ, IMX471_EXCK_FREQ(19.2) },
+	{ IMX471_REG_EXCK_FREQ, 0x1333 },
 	{ CCI_REG8(0x3c7e), 0x08 },
 	{ CCI_REG8(0x3c7f), 0x05 },
 	{ CCI_REG8(0x3e35), 0x00 },
@@ -296,7 +283,6 @@ static const struct imx471_mode imx471_modes[] = {
 		.fll_def = 1308,
 		.fll_min = 1308,
 		.llp = 2328,
-		.link_freq_index = IMX471_LINK_FREQ_INDEX,
 		.default_mode_regs = mode_1928x1088_regs,
 		.default_mode_regs_length = ARRAY_SIZE(mode_1928x1088_regs),
 	},
@@ -500,7 +486,7 @@ static int imx471_init_state(struct v4l2_subdev *sd,
 			     struct v4l2_subdev_state *sd_state)
 {
 	struct v4l2_subdev_format fmt = {
-		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+		.which = V4L2_SUBDEV_FORMAT_TRY,
 		.format = {
 			.code = MEDIA_BUS_FMT_SRGGB10_1X10,
 			.width = imx471_modes[0].width,
